@@ -59,6 +59,9 @@ __pycache__/
 gcp-key.json
 *.json.key
 
+# Local deployment secrets
+cloudrun-env.yaml
+
 # Terraform
 terraform/.terraform/
 terraform/.terraform.lock.hcl
