@@ -8,7 +8,7 @@ pipelines:
           - echo $GCP_KEY > /tmp/key.json
           - gcloud auth activate-service-account --key-file=/tmp/key.json
           - gcloud config set project $GCP_PROJECT_ID
-          - gcloud builds submit
+          - gcloud builds submit infra-app
               --tag asia-south1-docker.pkg.dev/$GCP_PROJECT_ID/infra-agent/order-api:$BITBUCKET_COMMIT
               --project $GCP_PROJECT_ID
           - gcloud run deploy order-api
