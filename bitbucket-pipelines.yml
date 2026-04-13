@@ -1,0 +1,59 @@
+image: google/cloud-sdk:alpine
+
+pipelines:
+  default:
+    - step:
+        name: Build and Deploy to Cloud Run
+        script:
+          - echo $GCP_KEY > /tmp/key.json
+          - gcloud auth activate-service-account --key-file=/tmp/key.json
+          - gcloud config set project $GCP_PROJECT_ID
+          - gcloud builds submit
+              --tag asia-south1-docker.pkg.dev/$GCP_PROJECT_ID/infra-agent/order-api:$BITBUCKET_COMMIT
+              --project $GCP_PROJECT_ID
+          - gcloud run deploy order-api
+              --image asia-south1-docker.pkg.dev/$GCP_PROJECT_ID/infra-agent/order-api:$BITBUCKET_COMMIT
+              --region asia-south1
+              --memory 256Mi
+              --cpu 1
+              --min-instances 0
+              --max-instances 5
+              --timeout 30
+              --allow-unauthenticated
+              --project $GCP_PROJECT_ID
+          # Notify agent that the pipeline succeeded and new image is live
+          - |
+            curl -s -X POST "$AGENT_WEBHOOK_URL/webhook" \
+              -H "X-Token: $WEBHOOK_SECRET" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"source\": \"bitbucket\",
+                \"status\": \"success\",
+                \"service_url\": \"$CLOUD_RUN_SERVICE_URL\",
+                \"build_number\": \"$BITBUCKET_BUILD_NUMBER\",
+                \"branch\": \"$BITBUCKET_BRANCH\",
+                \"commit\": \"$BITBUCKET_COMMIT\"
+              }"
+        after-script:
+          - |
+            if [ $BITBUCKET_EXIT_CODE -ne 0 ]; then
+              curl -s -X POST "$AGENT_WEBHOOK_URL/webhook" \
+                -H "X-Token: $WEBHOOK_SECRET" \
+                -H "Content-Type: application/json" \
+                -d "{
+                  \"source\": \"bitbucket\",
+                  \"status\": \"failure\",
+                  \"service_url\": \"$CLOUD_RUN_SERVICE_URL\",
+                  \"build_number\": \"$BITBUCKET_BUILD_NUMBER\",
+                  \"branch\": \"$BITBUCKET_BRANCH\",
+                  \"commit\": \"$BITBUCKET_COMMIT\",
+                  \"error\": \"Pipeline failed on build $BITBUCKET_BUILD_NUMBER\"
+                }"
+            fi
+
+# Bitbucket repository variables to set:
+# GCP_KEY               - service account JSON (paste full JSON)
+# GCP_PROJECT_ID        - your GCP project id
+# AGENT_WEBHOOK_URL     - your agent public URL
+# WEBHOOK_SECRET        - same secret as in agent .env
+# CLOUD_RUN_SERVICE_URL - filled after first deploy
