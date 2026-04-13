@@ -1,0 +1,40 @@
+# Copy this file to terraform.tfvars and fill in your values.
+# terraform.tfvars is gitignored — never commit real values.
+
+# ── Required ────────────────────────────────────────────────
+project_id = "your-gcp-project-id"
+
+# ── Optional overrides (cost-optimised defaults shown) ───────
+region       = "asia-south1"
+service_name = "order-api"
+# registry_name = "infra-agent"
+
+# ── Cloud Run — cost-optimised settings ──────────────────────
+# Memory: 256Mi is the lowest Cloud Run allows; increase only if OOM alerts fire.
+# cloudrun_memory        = "256Mi"
+
+# CPU: 1 vCPU is sufficient for a lightweight API. cpu_idle=true means you are
+# NOT billed for CPU when the instance is idle between requests.
+# cloudrun_cpu           = "1"
+
+# Scale-to-zero: min=0 means no idle instances → zero cost when no traffic.
+# cloudrun_min_instances = 0
+
+# Hard cap at 3 instances. Increase only if you consistently hit concurrency limits.
+# With concurrency=80, 3 instances can absorb 240 concurrent requests before throttling.
+# cloudrun_max_instances = 3
+
+# Concurrency: how many requests one instance handles simultaneously before Cloud Run
+# starts a new one. Higher = fewer instances = lower bill. 80 is a safe default.
+# cloudrun_concurrency   = 80
+
+# Timeout: keep short so slow requests fail fast rather than holding compute slots.
+# cloudrun_timeout       = 30
+
+# ── CI/CD service account ─────────────────────────────────────
+# Leave empty to create a new bitbucket-deployer service account.
+# bitbucket_service_account_email = ""
+
+# ── GCS state backend ─────────────────────────────────────────
+# Uncomment after creating the bucket (see backend.tf).
+# state_bucket_location = "ASIA-SOUTH1"

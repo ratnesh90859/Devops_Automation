@@ -48,3 +48,22 @@ Thumbs.db
 *.mov
 *.wmv
 
+# Python
+.env
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+
+# GCP credentials
+gcp-key.json
+*.json.key
+
+# Terraform
+terraform/.terraform/
+terraform/.terraform.lock.hcl
+terraform/terraform.tfvars
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/crash.log
+
