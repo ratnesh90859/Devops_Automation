@@ -14,12 +14,11 @@ class Settings(BaseSettings):
     TERRAFORM_DIR: str = "/app/terraform"
 
     # Bitbucket — required for code-level fixes pushed via pipeline
-    # Create an App Password at: Bitbucket → Settings → App passwords
-    # Required scopes: Repositories (read/write), Pipelines (read/write)
+    # Create an API token at: https://id.atlassian.com/manage-profile/security/api-tokens
+    # Token scopes needed: Repositories (read/write), Pipelines (read/write)
     BITBUCKET_WORKSPACE: str = ""
     BITBUCKET_REPO_SLUG: str = ""
-    BITBUCKET_USERNAME: str = ""
-    BITBUCKET_APP_PASSWORD: str = ""
+    BITBUCKET_API_TOKEN: str = ""
     BITBUCKET_BRANCH: str = "main"
 
     class Config:

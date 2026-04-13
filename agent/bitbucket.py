@@ -10,11 +10,10 @@ Responsibilities:
   - Poll pipeline status until it completes
 
 Credentials needed (add to .env):
-  BITBUCKET_WORKSPACE    - e.g. "my-team"
-  BITBUCKET_REPO_SLUG    - e.g. "infra-app"
-  BITBUCKET_USERNAME     - Bitbucket account username
-  BITBUCKET_APP_PASSWORD - Bitbucket App Password (Settings → App passwords)
-  BITBUCKET_BRANCH       - branch to commit/trigger (default: "main")
+  BITBUCKET_WORKSPACE  - e.g. "code_econz"
+  BITBUCKET_REPO_SLUG  - e.g. "devops_automation"
+  BITBUCKET_API_TOKEN  - Atlassian API Token (account.atlassian.com → Security → API tokens)
+  BITBUCKET_BRANCH     - branch to commit/trigger (default: "main")
 """
 import asyncio
 import httpx
@@ -23,8 +22,8 @@ from config import settings
 _BASE = "https://api.bitbucket.org/2.0"
 
 
-def _auth() -> tuple[str, str]:
-    return (settings.BITBUCKET_USERNAME, settings.BITBUCKET_APP_PASSWORD)
+def _headers() -> dict:
+    return {"Authorization": f"Bearer {settings.BITBUCKET_API_TOKEN}"}
 
 
 def _repo() -> str:
@@ -47,7 +46,7 @@ async def get_file(file_path: str) -> str:
         f"{settings.BITBUCKET_BRANCH}/{file_path}"
     )
     async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.get(url, auth=_auth())
+        r = await client.get(url, headers=_headers())
         r.raise_for_status()
         return r.text
 
@@ -66,7 +65,7 @@ async def commit_file(file_path: str, new_content: str, message: str) -> bool:
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(
             url,
-            auth=_auth(),
+            headers=_headers(),
             data={
                 "message": message,
                 "branch": settings.BITBUCKET_BRANCH,
@@ -95,7 +94,7 @@ async def trigger_pipeline(branch: str | None = None) -> str:
         }
     }
     async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(url, auth=_auth(), json=payload)
+        r = await client.post(url, headers=_headers(), json=payload)
         r.raise_for_status()
         return r.json()["uuid"]
 
@@ -109,7 +108,7 @@ async def get_pipeline_status(pipeline_uuid: str) -> str:
     """
     url = f"{_BASE}/repositories/{_repo()}/pipelines/{pipeline_uuid}"
     async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.get(url, auth=_auth())
+        r = await client.get(url, headers=_headers())
         r.raise_for_status()
         return r.json().get("state", {}).get("name", "UNKNOWN")
 
