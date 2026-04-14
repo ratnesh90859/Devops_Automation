@@ -5,6 +5,11 @@ from prometheus_client import (
     generate_latest, CONTENT_TYPE_LATEST
 )
 
+# Runtime toggle — set HEAVY_ENABLED=false env var to disable at deploy time,
+# or call POST /admin/disable-heavy to disable without redeploying.
+_heavy_enabled = os.getenv("HEAVY_ENABLED", "true").lower() != "false"
+_ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "infraguard-secret-2026")
+
 app = Flask(__name__)
 
 REQUEST_COUNT = Counter(
@@ -61,11 +66,43 @@ def orders():
 
 @app.route("/heavy")
 def heavy():
+    if not _heavy_enabled:
+        return jsonify({"error": "disabled"}), 503
     # simulates memory spike -> triggers OOM alert
     # cost-optimised default: 500000 (4x smaller than original 2000000)
     size = int(os.getenv("LOAD_SIZE", "500000"))
     data = [i for i in range(size)]
     return jsonify({"count": len(data)})
+
+
+def _check_admin_token():
+    token = request.headers.get("X-Admin-Token") or request.args.get("token")
+    return token == _ADMIN_TOKEN
+
+
+@app.route("/admin/disable-heavy", methods=["POST"])
+def disable_heavy():
+    global _heavy_enabled
+    if not _check_admin_token():
+        return jsonify({"error": "unauthorized"}), 401
+    _heavy_enabled = False
+    return jsonify({"heavy_enabled": False, "message": "/heavy endpoint disabled"})
+
+
+@app.route("/admin/enable-heavy", methods=["POST"])
+def enable_heavy():
+    global _heavy_enabled
+    if not _check_admin_token():
+        return jsonify({"error": "unauthorized"}), 401
+    _heavy_enabled = True
+    return jsonify({"heavy_enabled": True, "message": "/heavy endpoint enabled"})
+
+
+@app.route("/admin/status", methods=["GET"])
+def admin_status():
+    if not _check_admin_token():
+        return jsonify({"error": "unauthorized"}), 401
+    return jsonify({"heavy_enabled": _heavy_enabled})
 
 @app.route("/slow")
 def slow():
