@@ -41,8 +41,13 @@ async def webhook(request: Request, background: BackgroundTasks):
     service_url = body.get("service_url", settings.CLOUD_RUN_SERVICE_URL)
 
     async def run():
-        incident = await handle_alert(source, service_url)
-        await send_alert(incident)
+        try:
+            incident = await handle_alert(source, service_url)
+            await send_alert(incident)
+        except Exception as exc:
+            import traceback
+            print(f"[ERROR] background alert failed: {exc}")
+            traceback.print_exc()
 
     background.add_task(run)
     return {"received": True}

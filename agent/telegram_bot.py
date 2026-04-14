@@ -94,4 +94,5 @@ tg_app.add_handler(CallbackQueryHandler(handle_callback))
 
 
 async def setup():
+    await tg_app.initialize()
     await bot.set_webhook(f"{settings.BASE_URL}/telegram")
