@@ -18,21 +18,25 @@ def _token() -> str:
 
 
 async def get_config() -> dict:
-    async with httpx.AsyncClient() as c:
-        r = await c.get(BASE, headers={"Authorization": f"Bearer {_token()}"})
-        r.raise_for_status()
-        d = r.json()
-    t = d.get("template", {})
-    container = t.get("containers", [{}])[0]
-    limits = container.get("resources", {}).get("limits", {})
-    scaling = t.get("scaling", {})
-    return {
-        "memory": limits.get("memory", "256Mi"),
-        "cpu": limits.get("cpu", "1"),
-        "timeout": t.get("timeout", "30s").replace("s", ""),
-        "min_instances": scaling.get("minInstanceCount", 0),
-        "max_instances": scaling.get("maxInstanceCount", 5),
-    }
+    try:
+        async with httpx.AsyncClient(timeout=30) as c:
+            r = await c.get(BASE, headers={"Authorization": f"Bearer {_token()}"})
+            r.raise_for_status()
+            d = r.json()
+        t = d.get("template", {})
+        container = t.get("containers", [{}])[0]
+        limits = container.get("resources", {}).get("limits", {})
+        scaling = t.get("scaling", {})
+        return {
+            "memory": limits.get("memory", "256Mi"),
+            "cpu": limits.get("cpu", "1"),
+            "timeout": t.get("timeout", "30s").replace("s", ""),
+            "min_instances": scaling.get("minInstanceCount", 0),
+            "max_instances": scaling.get("maxInstanceCount", 5),
+        }
+    except Exception as e:
+        print(f"[WARN] get_config() failed ({e}), using defaults")
+        return {"memory": "256Mi", "cpu": "1", "timeout": "30", "min_instances": 0, "max_instances": 5}
 
 
 
