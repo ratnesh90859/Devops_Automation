@@ -11,9 +11,31 @@ _APP_FILE = "infra-app/app.py"
 
 
 async def handle_alert(source: str, service_url: str) -> dict:
+    import httpx
+
     previous_revision = get_current_revision()
-    logs = fetch_logs(minutes=5)
+    logs = fetch_logs(minutes=10)
     config = await get_config()
+
+    # Also probe the live service to give Gemini more context
+    live_status = "unknown"
+    live_body = ""
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get(service_url)
+            live_status = f"{r.status_code}"
+            live_body = r.text[:500]
+    except Exception as e:
+        live_status = f"unreachable ({e})"
+
+    # If no warning logs, tell AI the service status so it has context
+    if "No warning logs" in logs:
+        logs = (
+            f"No recent warning/error logs in Cloud Run.\n"
+            f"Live service check: {service_url} -> HTTP {live_status}\n"
+            f"Response body: {live_body}\n"
+        )
+
     diagnosis = await diagnose(logs, config)
 
     incident = create_incident({
@@ -21,6 +43,7 @@ async def handle_alert(source: str, service_url: str) -> dict:
         "service_url": service_url,
         "previous_revision": previous_revision,
         "logs": logs[:2000],
+        "live_status": live_status,
         **diagnosis
     })
     return incident

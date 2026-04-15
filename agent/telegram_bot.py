@@ -59,35 +59,61 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action, incident_id = query.data.split(":", 1)
 
     if action == "approve":
-        await query.edit_message_text("⏳ Applying fix...")
-        result = await flow.execute_fix(incident_id)
+        await query.edit_message_text("⏳ Applying fix... this may take a few minutes.")
 
-        if result["healthy"]:
-            if result.get("fix_type") == "code":
-                await query.edit_message_text(
-                    f"✅ *Code fix applied. Service is healthy.*\n\n"
-                    f"📦 Pushed to Bitbucket & deployed via pipeline.\n"
-                    f"_{result.get('commit_message', '')}_ \n"
-                    f"Pipeline: `{result.get('pipeline_uuid', 'n/a')}`",
-                    parse_mode="Markdown",
-                )
-            else:
-                await query.edit_message_text(
-                    f"✅ *Infra fix applied. Service is healthy.*\n\n"
-                    f"`{result['fix_field']}` \u2192 `{result['fix_new_value']}`",
-                    parse_mode="Markdown",
-                )
-        else:
-            reason = result.get("error") or result.get("rolled_back_to") or "unknown"
-            await query.edit_message_text(
-                f"🔄 *Fix failed. Rolled back.*\n\n"
-                f"Reason: `{reason}`",
+        try:
+            result = await flow.execute_fix(incident_id)
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            await bot.send_message(
+                chat_id=settings.TELEGRAM_CHAT_ID,
+                text=f"❌ *Fix failed with error:*\n`{str(exc)[:500]}`",
                 parse_mode="Markdown",
             )
+            return
+
+        try:
+            if result["healthy"]:
+                if result.get("fix_type") == "code":
+                    await bot.send_message(
+                        chat_id=settings.TELEGRAM_CHAT_ID,
+                        text=(
+                            f"✅ *Code fix applied. Service is healthy.*\n\n"
+                            f"📦 Pushed to Bitbucket & deployed via pipeline.\n"
+                            f"_{result.get('commit_message', '')}_ \n"
+                            f"Pipeline: `{result.get('pipeline_uuid', 'n/a')}`"
+                        ),
+                        parse_mode="Markdown",
+                    )
+                else:
+                    await bot.send_message(
+                        chat_id=settings.TELEGRAM_CHAT_ID,
+                        text=(
+                            f"✅ *Infra fix applied. Service is healthy.*\n\n"
+                            f"`{result.get('fix_field', '')}` \u2192 `{result.get('fix_new_value', '')}`"
+                        ),
+                        parse_mode="Markdown",
+                    )
+            else:
+                reason = result.get("error") or result.get("rolled_back_to") or "unknown"
+                await bot.send_message(
+                    chat_id=settings.TELEGRAM_CHAT_ID,
+                    text=(
+                        f"🔄 *Fix failed. Rolled back.*\n\n"
+                        f"Reason: `{reason}`"
+                    ),
+                    parse_mode="Markdown",
+                )
+        except Exception as exc:
+            print(f"[ERROR] sending result message: {exc}")
 
     elif action == "reject":
         await query.edit_message_text("❌ Rejected. No changes made.")
-        await flow.reject(incident_id)
+        try:
+            await flow.reject(incident_id)
+        except Exception as exc:
+            print(f"[ERROR] rejecting incident: {exc}")
 
 
 tg_app.add_handler(CallbackQueryHandler(handle_callback))
