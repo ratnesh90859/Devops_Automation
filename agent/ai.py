@@ -136,6 +136,114 @@ Return raw JSON only. No markdown fences. No explanation outside JSON.
     return json.loads(_strip_fences(response.text))
 
 
+async def correlate_signals(
+    infra_logs: str,
+    app_logs: str,
+    business_logs: str,
+    metrics: dict,
+    config: dict,
+) -> dict:
+    """
+    Correlate infrastructure logs, application logs, and business logs together
+    to find the true root cause chain:
+      Infrastructure problem → Application impact → Business impact
+
+    Or the reverse:
+      Bad code → Resource exhaustion → Infrastructure alert
+
+    Returns a structured correlation report.
+    """
+    prompt = f"""You are a senior SRE, backend engineer, and business analyst.
+
+You have THREE separate log streams and metrics from a production incident.
+Your job is to CORRELATE all signals and find the true root cause chain.
+
+═══════════════════════════════════════════════════════
+SERVICE CONFIG:
+{json.dumps(config, indent=2)}
+
+REAL-TIME METRICS:
+{json.dumps(metrics, indent=2)}
+
+═══════════════════════════════════════════════════════
+INFRASTRUCTURE LOGS (Cloud Run / container / platform logs):
+{infra_logs[:2000] if infra_logs else "No infra logs provided"}
+
+═══════════════════════════════════════════════════════
+APPLICATION LOGS (app-level errors, warnings, tracebacks):
+{app_logs[:2000] if app_logs else "No application logs provided"}
+
+═══════════════════════════════════════════════════════
+BUSINESS LOGS (order failures, payment errors, user-facing events):
+{business_logs[:2000] if business_logs else "No business logs provided"}
+
+═══════════════════════════════════════════════════════
+
+CORRELATION RULES:
+1. Find CAUSAL CHAIN — which layer triggered which:
+   - Infra (CPU/memory/network) → triggered by → App (bad code/leak) or external traffic spike
+   - App failures (5xx, exceptions) → caused by → Infra limits or bad code
+   - Business failures (orders failed, payments dropped) → caused by → App errors or Infra crash
+
+2. Classify ROOT LAYER:
+   - "infrastructure": The primary fault is in platform/resource configuration
+   - "application": The primary fault is in the code/logic
+   - "both": Neither infra nor app alone caused it — interaction between both
+
+3. Correlate TIMING:
+   - Did infra metrics spike BEFORE app errors? → Infra caused app failures
+   - Did app errors appear BEFORE infra metrics spiked? → App code caused resource exhaustion
+   - Did business failures appear together with app errors? → App outage caused business loss
+
+4. Issue types to detect:
+   INFRA:
+   - oom: Container memory exceeded limit (OOMKilled)
+   - high_cpu: CPU throttled > 80% sustained
+   - crash: Container restart loop
+   - cold_start: Scale-from-zero latency spike
+   - network_timeout: Upstream connectivity failure
+   - disk_pressure: Storage I/O exhaustion
+
+   APPLICATION:
+   - error_rate: HTTP 5xx rate > threshold
+   - memory_leak: Memory growing monotonically over time
+   - db_exhaustion: Connection pool exhausted / DB unreachable
+   - slow_query: Database or downstream query too slow
+   - unhandled_exception: Python exception / traceback
+   - cpu_bound: Expensive computation blocking event loop
+   - latency_spike: p95/p99 latency threshold breached
+
+Return raw JSON only. No markdown fences. No explanation outside JSON.
+
+{{
+  "root_layer": "infrastructure|application|both",
+  "infra_issue": "one of: oom|high_cpu|network_timeout|crash|cold_start|disk_pressure|none",
+  "app_issue": "one of: error_rate|memory_leak|db_exhaustion|slow_query|unhandled_exception|cpu_bound|latency_spike|none",
+  "causal_chain": [
+    "step 1: what triggered first",
+    "step 2: how it propagated",
+    "step 3: final user/business impact"
+  ],
+  "root_cause": "single precise sentence explaining the TRUE root cause with evidence from all three log layers",
+  "infra_evidence": ["infra log observation 1", "infra log observation 2"],
+  "app_evidence": ["app log observation 1", "app log observation 2"],
+  "business_evidence": ["business log observation 1", "business log observation 2"],
+  "correlation_insight": "key insight from COMBINING all three layers that would be missed looking at any single layer alone",
+  "business_impact": "specific business function affected, estimated revenue/user impact if known",
+  "immediate_fix": "exact action to take right now (<5 minutes)",
+  "longterm_fix": "permanent architectural or code solution",
+  "prevention": [
+    "specific alert to add with threshold",
+    "specific metric to track",
+    "code or infra improvement"
+  ],
+  "confidence": "High|Medium|Low",
+  "confidence_reason": "why based on quality and consistency of evidence across all three log streams"
+}}"""
+    response = _model.generate_content(prompt)
+    return json.loads(_strip_fences(response.text))
+
+
 async def suggest_code_fix(issue_type: str, logs: str, file_content: str) -> dict:
     """
     Given current application code and error logs, ask the AI to produce a

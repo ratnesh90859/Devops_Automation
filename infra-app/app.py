@@ -112,6 +112,54 @@ def slow():
     time.sleep(secs)
     return jsonify({"done": True})
 
+
+@app.route("/crash")
+def crash():
+    """Simulates unhandled exception → 500 error rate spike → triggers error_rate alert."""
+    # intentionally raises to produce a Python traceback in logs
+    data = {"orders": [{"id": 1, "amount": 100}]}
+    # divide by zero to create a real traceback
+    _ = data["orders"][0]["amount"] / 0
+    return jsonify({"done": True})
+
+
+# Global list that never gets cleared — simulates memory leak
+_leak_store: list = []
+
+@app.route("/leak")
+def leak():
+    """Simulates gradual memory leak — appends to a global list that is never freed."""
+    chunk_size = int(os.getenv("LEAK_SIZE", "50000"))
+    _leak_store.extend(range(chunk_size))
+    mem = psutil.Process(os.getpid()).memory_info().rss // (1024 * 1024)
+    return jsonify({"leak_items": len(_leak_store), "current_mem_mb": mem})
+
+
+@app.route("/cpu-spike")
+def cpu_spike():
+    """Simulates CPU-bound work — heavy computation → CPU throttling alert."""
+    iterations = int(os.getenv("CPU_ITERATIONS", "2000000"))
+    result = sum(i * i for i in range(iterations))
+    return jsonify({"result": result % 1000000})
+
+
+@app.route("/db-error")
+def db_error():
+    """Simulates database connection failure → 503 → DB exhaustion alert."""
+    import socket
+    try:
+        # Try connecting to a non-existent DB port — always fails
+        s = socket.create_connection(("127.0.0.1", 5432), timeout=2)
+        s.close()
+    except (ConnectionRefusedError, OSError):
+        ERROR_TOTAL.labels(endpoint="/db-error").inc()
+        return jsonify({
+            "error": "Database connection failed",
+            "detail": "connection refused: 127.0.0.1:5432 — pool exhausted or DB unreachable"
+        }), 503
+    return jsonify({"connected": True})
+
+
 @app.route("/metrics")
 def metrics():
     return Response(generate_latest(), mimetype=CONTENT_TYPE_LATEST)
