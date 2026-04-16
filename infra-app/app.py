@@ -64,7 +64,7 @@ def start_timer():
 
 @app.after_request
 def record_metrics(response):
-    latency = time.time() - request._start
+    latency = time.time() - getattr(request, '_start', time.time())
     ep = request.path
     REQUEST_COUNT.labels(
         method=request.method,
@@ -79,6 +79,22 @@ def record_metrics(response):
     elif latency > 2.0:
         log_app("slow_request", endpoint=ep, latency_s=round(latency, 3))
     return response
+
+@app.errorhandler(Exception)
+def handle_exception(e):
+    """Catch ALL unhandled exceptions — record metrics then return 500.
+    Without this, Flask re-raises exceptions and after_request never fires,
+    so ERROR_TOTAL is never incremented for /crash, /leak, etc.
+    """
+    ep = request.path
+    latency = time.time() - getattr(request, '_start', time.time())
+    ERROR_TOTAL.labels(endpoint=ep).inc()
+    REQUEST_COUNT.labels(method=request.method, endpoint=ep, http_status=500).inc()
+    REQUEST_LATENCY.labels(endpoint=ep).observe(latency)
+    MEMORY_BYTES.set(psutil.Process(os.getpid()).memory_info().rss)
+    log_app("unhandled_exception_500", endpoint=ep, error=str(e),
+            error_type=type(e).__name__, latency_s=round(latency, 3))
+    return jsonify({"error": "Internal Server Error", "detail": str(e)}), 500
 
 @app.route("/")
 def home():
@@ -157,15 +173,15 @@ def crash():
     log_app("crash_endpoint_called")
     log_biz("order_processing_failed", reason="unhandled_exception",
             endpoint="/crash", impact="order_lost")
-    try:
-        data = {"orders": [{"id": 1, "amount": 100}]}
-        _ = data["orders"][0]["amount"] / 0
-    except ZeroDivisionError as e:
-        log_app("unhandled_exception", error=str(e), traceback="ZeroDivisionError in /crash",
-                endpoint="/crash")
-        log_biz("order_failed", error_type="ZeroDivisionError",
-                orders_affected=1, revenue_lost_usd=100)
-        raise
+    # Explicitly increment error counter BEFORE raising so it's always recorded
+    # even if errorhandler is not triggered in some edge case
+    ERROR_TOTAL.labels(endpoint="/crash").inc()
+    log_app("unhandled_exception", error="division by zero",
+            traceback="ZeroDivisionError in /crash", endpoint="/crash")
+    log_biz("order_failed", error_type="ZeroDivisionError",
+            orders_affected=1, revenue_lost_usd=100)
+    data = {"orders": [{"id": 1, "amount": 100}]}
+    _ = data["orders"][0]["amount"] / 0  # raises ZeroDivisionError → caught by errorhandler
 
 
 @app.route("/leak")
