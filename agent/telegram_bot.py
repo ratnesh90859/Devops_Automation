@@ -2,6 +2,9 @@ import flow
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes
 from config import settings
+from logger import fetch_all_loki_logs
+from ai import correlate_signals
+from cloudrun import get_config
 
 bot = Bot(token=settings.TELEGRAM_BOT_TOKEN)
 tg_app = Application.builder().token(settings.TELEGRAM_BOT_TOKEN).build()
@@ -115,6 +118,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         ),
                         parse_mode="Markdown",
                     )
+
+                # Fetch real incident from DB and send post-mortem
+                from db import get_incident
+                full_incident = get_incident(incident_id) or {}
+                await send_resolution_report(full_incident, result)
             else:
                 reason = result.get("error") or result.get("rolled_back_to") or "unknown"
                 reason = _esc(str(reason)[:300])
@@ -184,6 +192,102 @@ async def send_deep_report(incident: dict) -> None:
         )
     except Exception as exc:
         print(f"[ERROR] send_deep_report: {exc}")
+
+
+async def send_resolution_report(incident: dict, fix_result: dict) -> None:
+    """
+    Post-incident resolution report sent to Telegram after a successful fix.
+    Fetches REAL logs from GCP Cloud Logging, correlates all 3 layers,
+    and shows the true root cause + business impact.
+    """
+    try:
+        # Fetch fresh logs NOW (after the incident, to see what actually happened)
+        loki_logs = fetch_all_loki_logs(minutes=30)
+        config    = await get_config()
+
+        # Build metrics summary from the incident
+        metrics = {
+            "issue_type":    incident.get("issue_type", "unknown"),
+            "severity":      incident.get("severity", "unknown"),
+            "confidence":    incident.get("confidence", 0),
+            "fix_field":     incident.get("fix_field", ""),
+            "fix_old_value": incident.get("fix_old_value", ""),
+            "fix_new_value": incident.get("fix_new_value", ""),
+        }
+
+        report = await correlate_signals(
+            infra_logs=loki_logs.get("infra", ""),
+            app_logs=loki_logs.get("app", ""),
+            business_logs=loki_logs.get("business", ""),
+            metrics=metrics,
+            config=config,
+        )
+
+        # Format causal chain
+        chain_lines = "\n".join(
+            f"  {i+1}\\. {_esc(str(s))}" for i, s in enumerate(report.get("causal_chain") or [])
+        )
+        infra_ev = "\n".join(f"  • {_esc(str(e))}" for e in (report.get("infra_evidence") or []))
+        app_ev   = "\n".join(f"  • {_esc(str(e))}" for e in (report.get("app_evidence") or []))
+        biz_ev   = "\n".join(f"  • {_esc(str(e))}" for e in (report.get("business_evidence") or []))
+        prevent  = "\n".join(f"  • {_esc(str(p))}" for p in (report.get("prevention") or []))
+
+        conf     = report.get("confidence", "?")
+        conf_icon = {"High": "🟢", "Medium": "🟡", "Low": "🔴"}.get(conf, "⚪")
+
+        root_layer = report.get("root_layer", "unknown").upper()
+        layer_icon = {"INFRASTRUCTURE": "🏗️", "APPLICATION": "🐛", "BOTH": "⚡"}.get(root_layer, "❓")
+
+        # Fix summary line
+        if fix_result.get("fix_type") == "code":
+            fix_summary = _esc(fix_result.get("commit_message", "Code patch deployed"))
+        else:
+            field = _esc(str(fix_result.get("fix_field", "")))
+            old   = _esc(str(fix_result.get("fix_old_value", "")))
+            new   = _esc(str(fix_result.get("fix_new_value", "")))
+            fix_summary = f"{field}: {old} → {new}"
+
+        text = (
+            f"✅ *Incident Resolved — Post\\-Mortem Report*\n\n"
+            f"{layer_icon} *Root Layer:* {_esc(root_layer)}\n"
+            f"*Infra Issue:* {_esc(report.get('infra_issue', 'none'))}\n"
+            f"*App Issue:* {_esc(report.get('app_issue', 'none'))}\n\n"
+            f"*True Root Cause:*\n{_esc(str(report.get('root_cause', 'N/A')))}\n\n"
+            f"*Causal Chain:*\n{chain_lines}\n\n"
+            f"*Evidence Per Layer:*\n"
+            f"🏗️ Infra:\n{infra_ev if infra_ev else '  N/A'}\n"
+            f"🐛 App:\n{app_ev if app_ev else '  N/A'}\n"
+            f"💼 Business:\n{biz_ev if biz_ev else '  N/A'}\n\n"
+            f"*Business Impact:*\n{_esc(str(report.get('business_impact', 'N/A')))}\n\n"
+            f"*Correlation Insight:*\n{_esc(str(report.get('correlation_insight', 'N/A')))}\n\n"
+            f"*Fix Applied:* `{fix_summary}`\n\n"
+            f"*Prevention:*\n{prevent}\n\n"
+            f"{conf_icon} *Confidence:* {conf} — {_esc(str(report.get('confidence_reason', '')))}"
+        )
+
+        await bot.send_message(
+            chat_id=settings.TELEGRAM_CHAT_ID,
+            text=text,
+            parse_mode="MarkdownV2",
+        )
+    except Exception as exc:
+        print(f"[ERROR] send_resolution_report: {exc}")
+        # Send a simplified fallback
+        try:
+            await bot.send_message(
+                chat_id=settings.TELEGRAM_CHAT_ID,
+                text=(
+                    f"✅ *Incident Resolved*\n\n"
+                    f"Issue: {_esc(str(incident.get('issue_type', 'unknown')))}\n"
+                    f"Root Cause: {_esc(str(incident.get('root_cause', 'N/A')))}\n"
+                    f"Fix: {_esc(str(incident.get('fix_field', '')))}: "
+                    f"{_esc(str(incident.get('fix_old_value', '')))} → "
+                    f"{_esc(str(incident.get('fix_new_value', '')))}"
+                ),
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
 
 
 async def setup():
