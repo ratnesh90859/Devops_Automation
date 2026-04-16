@@ -1,0 +1,47 @@
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+
+positions:
+  filename: /tmp/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+
+scrape_configs:
+
+  # ── Scrape all Docker container stdout/stderr logs ──────────────────────────
+  - job_name: docker-containers
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 5s
+    relabel_configs:
+      - source_labels: [__meta_docker_container_name]
+        target_label: container
+      - source_labels: [__meta_docker_container_label_com_docker_compose_service]
+        target_label: service
+      - source_labels: [__meta_docker_container_label_com_docker_compose_project]
+        target_label: project
+
+  # ── Parse order-api logs and extract log_type label ─────────────────────────
+  # Logs from order-api use structured format:
+  #   [INFRA]  ... infrastructure events
+  #   [APP]    ... application errors/warnings
+  #   [BIZ]    ... business events (order placed, order failed, payment)
+  - job_name: order-api-structured
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 5s
+        filters:
+          - name: label
+            values: ["com.docker.compose.service=order-api"]
+    pipeline_stages:
+      - regex:
+          expression: '^\[(?P<log_type>INFRA|APP|BIZ)\]\s+(?P<message>.*)'
+      - labels:
+          log_type:
+      - output:
+          source: message
+    relabel_configs:
+      - source_labels: [__meta_docker_container_label_com_docker_compose_service]
+        target_label: service

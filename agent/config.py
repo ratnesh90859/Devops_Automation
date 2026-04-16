@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     BITBUCKET_API_TOKEN: str = ""
     BITBUCKET_BRANCH: str = "main"
 
+    # Loki — local only (docker-compose); leave empty for Cloud Run
+    LOKI_URL: str = ""
+
     class Config:
         env_file = ".env"
 

@@ -1,5 +1,5 @@
 import asyncio
-from logger import fetch_logs, get_current_revision
+from logger import fetch_logs, fetch_all_loki_logs, get_current_revision
 from cloudrun import get_config, is_healthy
 import terraform_runner
 import bitbucket
@@ -16,6 +16,7 @@ async def handle_alert(source: str, service_url: str, alert_body: dict = None) -
 
     previous_revision = get_current_revision()
     logs = fetch_logs(minutes=10)
+    loki_logs = fetch_all_loki_logs(minutes=10)
     config = await get_config()
 
     # Also probe the live service to give Gemini more context
@@ -50,6 +51,14 @@ async def handle_alert(source: str, service_url: str, alert_body: dict = None) -
     else:
         context_parts.append(f"CLOUD RUN LOGS:\n{logs}")
 
+    # Include Loki structured logs (infra / app / business)
+    if loki_logs.get("infra") and "unavailable" not in loki_logs["infra"]:
+        context_parts.append(f"INFRASTRUCTURE LOGS (Loki):\n{loki_logs['infra'][:1000]}")
+    if loki_logs.get("app") and "unavailable" not in loki_logs["app"]:
+        context_parts.append(f"APPLICATION LOGS (Loki):\n{loki_logs['app'][:1000]}")
+    if loki_logs.get("business") and "unavailable" not in loki_logs["business"]:
+        context_parts.append(f"BUSINESS LOGS (Loki):\n{loki_logs['business'][:1000]}")
+
     # Always include live probe results
     context_parts.append(
         f"LIVE SERVICE PROBE: {service_url} -> HTTP {live_status}\n"
@@ -71,6 +80,9 @@ async def handle_alert(source: str, service_url: str, alert_body: dict = None) -
         "logs": enriched_logs[:2000],
         "live_status": live_status,
         "deep_report": deep_report,
+        "loki_infra_logs": loki_logs.get("infra", ""),
+        "loki_app_logs": loki_logs.get("app", ""),
+        "loki_business_logs": loki_logs.get("business", ""),
         **diagnosis
     })
     return incident
