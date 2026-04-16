@@ -3,15 +3,16 @@ from logger import fetch_logs, get_current_revision
 from cloudrun import get_config, is_healthy
 import terraform_runner
 import bitbucket
-from ai import diagnose, suggest_code_fix
+from ai import diagnose, analyze_deep, suggest_code_fix
 from db import create_incident, get_incident, update_incident
 
 # Path inside the Bitbucket repo that contains the app source
 _APP_FILE = "infra-app/app.py"
 
 
-async def handle_alert(source: str, service_url: str) -> dict:
+async def handle_alert(source: str, service_url: str, alert_body: dict = None) -> dict:
     import httpx
+    import json as _json
 
     previous_revision = get_current_revision()
     logs = fetch_logs(minutes=10)
@@ -28,22 +29,48 @@ async def handle_alert(source: str, service_url: str) -> dict:
     except Exception as e:
         live_status = f"unreachable ({e})"
 
-    # If no warning logs, tell AI the service status so it has context
-    if "No warning logs" in logs:
-        logs = (
-            f"No recent warning/error logs in Cloud Run.\n"
-            f"Live service check: {service_url} -> HTTP {live_status}\n"
-            f"Response body: {live_body}\n"
+    # Build enriched context for AI
+    context_parts = []
+
+    # Include Grafana/source alert details so AI knows WHY the alert fired
+    if alert_body:
+        alert_summary = {
+            k: v for k, v in alert_body.items()
+            if k not in ("service_url",)
+        }
+        context_parts.append(
+            f"ALERT PAYLOAD (from {source}):\n{_json.dumps(alert_summary, indent=2, default=str)[:1500]}"
         )
 
-    diagnosis = await diagnose(logs, config)
+    # Include Cloud Run logs
+    if "No warning logs" in logs:
+        context_parts.append(
+            f"CLOUD RUN LOGS: No recent warning/error logs found."
+        )
+    else:
+        context_parts.append(f"CLOUD RUN LOGS:\n{logs}")
+
+    # Always include live probe results
+    context_parts.append(
+        f"LIVE SERVICE PROBE: {service_url} -> HTTP {live_status}\n"
+        f"Response body: {live_body}"
+    )
+
+    enriched_logs = "\n\n".join(context_parts)
+
+    # Run fast diagnosis + deep SRE analysis in parallel
+    diagnosis, deep_report = await asyncio.gather(
+        diagnose(enriched_logs, config),
+        analyze_deep(enriched_logs, config),
+    )
 
     incident = create_incident({
         "source": source,
         "service_url": service_url,
         "previous_revision": previous_revision,
-        "logs": logs[:2000],
+        "logs": enriched_logs[:2000],
         "live_status": live_status,
+        "deep_report": deep_report,
         **diagnosis
     })
     return incident

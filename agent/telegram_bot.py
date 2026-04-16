@@ -17,22 +17,33 @@ ICONS = {
 }
 
 
+def _esc(text: str) -> str:
+    """Escape Telegram Markdown special characters in dynamic text."""
+    for ch in ("_", "*", "`", "["):
+        text = text.replace(ch, f"\\{ch}")
+    return text
+
+
 async def send_alert(incident: dict) -> int:
     icon = ICONS.get(incident["issue_type"], "⚠️")
     fix_type = incident.get("fix_type", "infra")
-    fix_label = "🔧 Bitbucket code push" if fix_type == "code" else "⚙️ Terraform infra change"
+    fix_label = "Bitbucket code push" if fix_type == "code" else "Terraform infra change"
+
+    root_cause = _esc(str(incident.get('root_cause', 'N/A')))
+    fix_reason = _esc(str(incident.get('fix_reason', 'N/A')))
+    fix_field = _esc(str(incident.get('fix_field', '')))
+    fix_old = _esc(str(incident.get('fix_old_value', '')))
+    fix_new = _esc(str(incident.get('fix_new_value', '')))
 
     text = (
         f"{icon} *Infra Issue Detected*\n\n"
         f"*Issue:* {incident['issue_type'].upper()}\n"
-        f"*Severity:* {incident['severity'].upper()}\n"
-        f"*Confidence:* {int(incident['confidence'] * 100)}%\n\n"
-        f"*Root Cause:*\n{incident['root_cause']}\n\n"
+        f"*Severity:* {incident.get('severity', 'unknown').upper()}\n"
+        f"*Confidence:* {int(float(incident.get('confidence', 0)) * 100)}%\n\n"
+        f"*Root Cause:*\n{root_cause}\n\n"
         f"*Proposed Fix ({fix_label}):*\n"
-        f"Change `{incident['fix_field']}` "
-        f"from `{incident['fix_old_value']}` "
-        f"\u2192 `{incident['fix_new_value']}`\n"
-        f"_{incident['fix_reason']}_"
+        f"{fix_field}: {fix_old} -> {fix_new}\n"
+        f"{fix_reason}"
     )
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton(
@@ -55,20 +66,27 @@ async def send_alert(incident: dict) -> int:
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    try:
+        await query.answer()
+    except Exception:
+        pass  # callback may have expired — continue anyway
     action, incident_id = query.data.split(":", 1)
 
     if action == "approve":
-        await query.edit_message_text("⏳ Applying fix... this may take a few minutes.")
+        try:
+            await query.edit_message_text("⏳ Applying fix... this may take a few minutes.")
+        except Exception:
+            pass
 
         try:
             result = await flow.execute_fix(incident_id)
         except Exception as exc:
             import traceback
             traceback.print_exc()
+            err_msg = _esc(str(exc)[:300])
             await bot.send_message(
                 chat_id=settings.TELEGRAM_CHAT_ID,
-                text=f"❌ *Fix failed with error:*\n`{str(exc)[:500]}`",
+                text=f"❌ *Fix failed with error:*\n{err_msg}",
                 parse_mode="Markdown",
             )
             return
@@ -76,32 +94,35 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             if result["healthy"]:
                 if result.get("fix_type") == "code":
+                    msg_text = _esc(result.get('commit_message', ''))
                     await bot.send_message(
                         chat_id=settings.TELEGRAM_CHAT_ID,
                         text=(
                             f"✅ *Code fix applied. Service is healthy.*\n\n"
-                            f"📦 Pushed to Bitbucket & deployed via pipeline.\n"
-                            f"_{result.get('commit_message', '')}_ \n"
-                            f"Pipeline: `{result.get('pipeline_uuid', 'n/a')}`"
+                            f"Pushed to Bitbucket and deployed via pipeline.\n"
+                            f"{msg_text}"
                         ),
                         parse_mode="Markdown",
                     )
                 else:
+                    field = _esc(str(result.get('fix_field', '')))
+                    value = _esc(str(result.get('fix_new_value', '')))
                     await bot.send_message(
                         chat_id=settings.TELEGRAM_CHAT_ID,
                         text=(
                             f"✅ *Infra fix applied. Service is healthy.*\n\n"
-                            f"`{result.get('fix_field', '')}` \u2192 `{result.get('fix_new_value', '')}`"
+                            f"{field} updated to {value}"
                         ),
                         parse_mode="Markdown",
                     )
             else:
                 reason = result.get("error") or result.get("rolled_back_to") or "unknown"
+                reason = _esc(str(reason)[:300])
                 await bot.send_message(
                     chat_id=settings.TELEGRAM_CHAT_ID,
                     text=(
                         f"🔄 *Fix failed. Rolled back.*\n\n"
-                        f"Reason: `{reason}`"
+                        f"Reason: {reason}"
                     ),
                     parse_mode="Markdown",
                 )
@@ -117,6 +138,52 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 tg_app.add_handler(CallbackQueryHandler(handle_callback))
+
+
+async def send_deep_report(incident: dict) -> None:
+    """Send the full structured SRE report as a second Telegram message."""
+    report = incident.get("deep_report")
+    if not report:
+        return
+
+    def _e(val) -> str:
+        return _esc(str(val)) if val else "N/A"
+
+    evidence_lines = "\n".join(
+        f"  • {_e(e)}" for e in (report.get("key_evidence") or [])
+    )
+    timeline_lines = "\n".join(
+        f"  {i+1}\\. {_e(t)}" for i, t in enumerate(report.get("timeline") or [])
+    )
+    prevention_lines = "\n".join(
+        f"  • {_e(p)}" for p in (report.get("prevention") or [])
+    )
+
+    confidence = report.get("confidence", "?")
+    conf_icon = {"High": "🟢", "Medium": "🟡", "Low": "🔴"}.get(confidence, "⚪")
+
+    text = (
+        f"📋 *Deep SRE Analysis Report*\n\n"
+        f"*Issue Classification:* {_e(report.get('issue_classification'))}\n\n"
+        f"*Root Cause:*\n{_e(report.get('root_cause'))}\n\n"
+        f"*Key Evidence:*\n{evidence_lines}\n\n"
+        f"*Timeline:*\n{timeline_lines}\n\n"
+        f"*Business Impact:*\n{_e(report.get('business_impact'))}\n\n"
+        f"*Recommended Fix:*\n"
+        f"  ⚡ Immediate: {_e(report.get('immediate_fix'))}\n"
+        f"  🔧 Long\\-term: {_e(report.get('longterm_fix'))}\n\n"
+        f"*Prevention Strategy:*\n{prevention_lines}\n\n"
+        f"*Confidence:* {conf_icon} {confidence} — {_e(report.get('confidence_reason'))}"
+    )
+
+    try:
+        await bot.send_message(
+            chat_id=settings.TELEGRAM_CHAT_ID,
+            text=text,
+            parse_mode="MarkdownV2",
+        )
+    except Exception as exc:
+        print(f"[ERROR] send_deep_report: {exc}")
 
 
 async def setup():
