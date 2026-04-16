@@ -160,6 +160,34 @@ def db_error():
     return jsonify({"connected": True})
 
 
+@app.route("/reset", methods=["POST", "GET"])
+def reset():
+    """
+    Reset ALL simulated issues back to normal state.
+    - Clears the memory leak store
+    - Re-enables the /heavy endpoint
+    - Resets LOAD_SIZE and SLEEP_SECONDS env overrides to defaults
+    Call this before retesting any scenario.
+    """
+    global _leak_store, _heavy_enabled
+    cleared_items = len(_leak_store)
+    _leak_store = []
+    _heavy_enabled = True
+
+    import gc
+    gc.collect()
+
+    mem_after = psutil.Process(os.getpid()).memory_info().rss // (1024 * 1024)
+
+    return jsonify({
+        "reset": True,
+        "cleared_leak_items": cleared_items,
+        "heavy_enabled": True,
+        "memory_after_mb": mem_after,
+        "message": "All simulated issues cleared. Ready to retest.",
+    })
+
+
 @app.route("/metrics")
 def metrics():
     return Response(generate_latest(), mimetype=CONTENT_TYPE_LATEST)

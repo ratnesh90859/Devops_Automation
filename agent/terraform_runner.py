@@ -18,6 +18,13 @@ import subprocess
 
 from config import settings
 
+_ANSI_RE = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
+
+
+def _strip_ansi(text: str) -> str:
+    """Remove ANSI color/escape codes from terraform output."""
+    return _ANSI_RE.sub('', text)
+
 # Maps AI fix_field → Terraform variable name in terraform.tfvars
 FIELD_TO_TFVAR: dict[str, str] = {
     "memory":        "cloudrun_memory",
@@ -84,25 +91,70 @@ def _ensure_init() -> None:
         )
 
 
+def _try_force_unlock(error_output: str) -> bool:
+    """If terraform failed due to a stale state lock, force-unlock and return True."""
+    m = re.search(r'ID:\s+(\d+)', error_output)
+    if not m:
+        return False
+    lock_id = m.group(1)
+    print(f"[terraform] Auto-unlocking stale lock {lock_id}")
+    r = subprocess.run(
+        ["terraform", "force-unlock", "-force", lock_id],
+        capture_output=True, text=True,
+        cwd=settings.TERRAFORM_DIR,
+    )
+    return r.returncode == 0
+
+
+def _summarize_error(raw: str) -> str:
+    """Extract a clean human-readable error from terraform output."""
+    clean = _strip_ansi(raw).strip()
+    # Extract the core Error line
+    error_lines = []
+    for line in clean.splitlines():
+        line = line.strip().lstrip('│').strip()
+        if not line:
+            continue
+        if line.startswith('╷') or line.startswith('╵'):
+            continue
+        error_lines.append(line)
+    summary = '\n'.join(error_lines[:10])
+    return summary[:500] if summary else clean[:500]
+
+
 async def _run_apply() -> tuple[bool, str]:
     """
     Run terraform apply targeting only the Cloud Run service.
-    Returns (success, output_snippet).
+    Auto-retries once if a stale state lock is detected.
+    Returns (success, clean_output).
     """
     _ensure_init()
-    result = await asyncio.to_thread(
-        subprocess.run,
-        [
-            "terraform", "apply",
-            "-auto-approve",
-            "-target=google_cloud_run_v2_service.order_api",
-        ],
-        capture_output=True,
-        text=True,
-        cwd=settings.TERRAFORM_DIR,
-    )
-    output = (result.stderr or result.stdout or "")[:1000]
-    return result.returncode == 0, output
+
+    for attempt in range(2):
+        result = await asyncio.to_thread(
+            subprocess.run,
+            [
+                "terraform", "apply",
+                "-auto-approve",
+                "-target=google_cloud_run_v2_service.order_api",
+            ],
+            capture_output=True,
+            text=True,
+            cwd=settings.TERRAFORM_DIR,
+        )
+        raw = (result.stderr or result.stdout or "")
+        if result.returncode == 0:
+            return True, _strip_ansi(raw)[:500]
+
+        # If state lock error, auto-unlock and retry once
+        if "Error acquiring the state lock" in raw and attempt == 0:
+            if _try_force_unlock(raw):
+                print("[terraform] Lock cleared, retrying apply...")
+                continue
+
+        return False, _summarize_error(raw)
+
+    return False, "Terraform apply failed after retry"
 
 
 async def apply_fix(field: str, new_value: str) -> tuple[bool, str]:
@@ -127,3 +179,38 @@ async def revert_fix(field: str, old_value: str) -> tuple[bool, str]:
         return False, f"Unknown fix field: {field}"
     write_tfvar(tfvar, old_value)
     return await _run_apply()
+
+
+# Baseline values — what the service should look like before any AI fix
+_BASELINE: dict[str, str] = {
+    "cloudrun_memory":        "256Mi",
+    "cloudrun_cpu":           "1",
+    "cloudrun_timeout":       "30",
+    "cloudrun_min_instances": "0",
+    "cloudrun_max_instances": "3",
+}
+
+
+async def reset_to_baseline() -> tuple[bool, str]:
+    """
+    Reset ALL terraform.tfvars values back to baseline so you can retest
+    from a clean state. Runs terraform apply after writing baseline values.
+    Returns (success, output_summary).
+    """
+    current = read_tfvars()
+    changed: list[str] = []
+
+    for tfvar, baseline_value in _BASELINE.items():
+        current_value = current.get(tfvar, "")
+        if current_value != baseline_value:
+            write_tfvar(tfvar, baseline_value)
+            changed.append(f"{tfvar}: {current_value!r} → {baseline_value!r}")
+
+    if not changed:
+        return True, "Already at baseline — no changes needed."
+
+    ok, output = await _run_apply()
+    summary = "Reset changes:\n" + "\n".join(f"  • {c}" for c in changed)
+    if ok:
+        return True, f"Baseline restored.\n{summary}"
+    return False, f"Terraform apply failed after baseline reset.\n{summary}\n\nError:\n{output}"

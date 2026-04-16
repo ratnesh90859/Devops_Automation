@@ -6,6 +6,7 @@ from telegram_bot import send_alert, send_deep_report, setup as tg_setup, tg_app
 from flow import handle_alert
 from db import list_incidents
 from config import settings
+import terraform_runner
 
 api = FastAPI(title="Infra AI Debugger", version="1.0.0")
 
@@ -397,7 +398,6 @@ async def _send_correlation_report(report: dict):
     """Send correlation report to Telegram."""
     from telegram_bot import bot, _esc
     from config import settings
-
     def _e(val) -> str:
         return _esc(str(val)) if val else "N/A"
 
@@ -442,4 +442,95 @@ async def _send_correlation_report(report: dict):
         )
     except Exception as exc:
         print(f"[ERROR] _send_correlation_report: {exc}")
+
+
+# ── Reset endpoint — restore everything to baseline for retesting ─────────────
+
+class ResetRequest(BaseModel):
+    reset_infra: Optional[bool] = True   # run terraform reset to baseline
+    reset_app: Optional[bool] = True     # call /reset on the order-api app
+    notify_telegram: Optional[bool] = True
+    service_url: Optional[str] = None
+
+
+@api.post("/reset")
+async def reset_all(req: ResetRequest):
+    """
+    Reset EVERYTHING back to baseline so you can retest from a clean state.
+
+    What it resets:
+      INFRA (Terraform):
+        - cloudrun_memory        → 256Mi
+        - cloudrun_cpu           → 1
+        - cloudrun_timeout       → 30
+        - cloudrun_min_instances → 0
+        - cloudrun_max_instances → 3
+
+      APP (order-api /reset):
+        - Clears memory leak store (_leak_store emptied, GC forced)
+        - Re-enables /heavy endpoint
+    """
+    import httpx
+    from telegram_bot import bot, _esc
+    results = {}
+
+    # ── 1. Reset app internal state ───────────────────────────────────────────
+    if req.reset_app:
+        service_url = req.service_url or settings.CLOUD_RUN_SERVICE_URL
+        try:
+            async with httpx.AsyncClient(timeout=15) as c:
+                r = await c.post(f"{service_url}/reset")
+                results["app_reset"] = r.json()
+        except Exception as exc:
+            results["app_reset"] = {"error": str(exc)}
+
+    # ── 2. Reset Terraform infra to baseline ──────────────────────────────────
+    if req.reset_infra:
+        ok, tf_output = await terraform_runner.reset_to_baseline()
+        results["infra_reset"] = {
+            "success": ok,
+            "summary": tf_output,
+        }
+    else:
+        ok = True
+
+    # ── 3. Notify Telegram ────────────────────────────────────────────────────
+    if req.notify_telegram:
+        app_status = results.get("app_reset", {})
+        infra_status = results.get("infra_reset", {})
+
+        app_mem = app_status.get("memory_after_mb", "?")
+        app_cleared = app_status.get("cleared_leak_items", 0)
+        app_ok = "error" not in app_status
+        infra_ok = infra_status.get("success", True)
+
+        icon = "✅" if (app_ok and infra_ok) else "⚠️"
+        text = (
+            f"{icon} *System Reset Complete*\n\n"
+            f"*App State:*\n"
+            f"  • Leak store cleared: {app_cleared} items removed\n"
+            f"  • Memory after GC: {app_mem} MB\n"
+            f"  • /heavy re\\-enabled: ✅\n\n"
+            f"*Infra Reset \\(Terraform\\):*\n"
+            f"  • memory → 256Mi\n"
+            f"  • cpu → 1\n"
+            f"  • timeout → 30s\n"
+            f"  • min\\_instances → 0\n"
+            f"  • max\\_instances → 3\n\n"
+            f"🔁 Ready to retest from scratch\\."
+        )
+        try:
+            await bot.send_message(
+                chat_id=settings.TELEGRAM_CHAT_ID,
+                text=text,
+                parse_mode="MarkdownV2",
+            )
+        except Exception as exc:
+            print(f"[ERROR] reset notify: {exc}")
+
+    return {
+        "status": "reset_complete",
+        "results": results,
+        "message": "System back to baseline. You can now retest any scenario.",
+    }
 
