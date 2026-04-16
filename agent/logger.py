@@ -46,7 +46,7 @@ def _fetch_gcp_structured_logs(prefix: str, minutes: int = 10, max_results: int 
     filter_str = (
         f'resource.type="cloud_run_revision" '
         f'AND resource.labels.service_name="{settings.CLOUD_RUN_SERVICE}" '
-        f'AND textPayload=~"^\\[{prefix}\\]" '
+        f'AND textPayload:"[{prefix}]" '
         f'AND timestamp>="{since}"'
     )
 
