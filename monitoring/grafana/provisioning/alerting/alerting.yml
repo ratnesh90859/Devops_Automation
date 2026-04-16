@@ -1,0 +1,33 @@
+apiVersion: 1
+
+# ── Contact Points ─────────────────────────────────────────────────────────────
+# Grafana sends alert webhooks to infra-agent /webhook endpoint
+contactPoints:
+  - orgId: 1
+    name: infra-agent-webhook
+    receivers:
+      - uid: infra-agent-receiver
+        type: webhook
+        settings:
+          url: https://infra-agent-546580006264.asia-south1.run.app/webhook
+          httpMethod: POST
+          # Include all alert labels and annotations in the payload
+          maxAlerts: 0
+        disableResolveMessage: false
+
+# ── Notification Policies ──────────────────────────────────────────────────────
+# All alerts → infra-agent-webhook
+policies:
+  - orgId: 1
+    receiver: infra-agent-webhook
+    group_by: ["alertname", "service"]
+    group_wait: 10s
+    group_interval: 1m
+    repeat_interval: 4h
+    routes:
+      - receiver: infra-agent-webhook
+        matchers:
+          - service = order-api
+        group_wait: 5s
+        group_interval: 30s
+        repeat_interval: 2h

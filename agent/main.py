@@ -18,17 +18,22 @@ async def startup():
 
 @api.post("/webhook")
 async def webhook(request: Request, background: BackgroundTasks):
-    if request.headers.get("X-Token") != settings.WEBHOOK_SECRET:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
     body = await request.json()
     source = body.get("source", "grafana")
 
+    # Grafana sends alerts without a secret token — identify it by payload shape
+    # All other callers must provide X-Token header
+    is_grafana = (
+        "alerts" in body                   # Grafana unified alerting payload
+        or source == "grafana"
+        or "externalURL" in body           # Grafana includes this field
+    )
+    if not is_grafana:
+        if request.headers.get("X-Token") != settings.WEBHOOK_SECRET:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
     # ------------------------------------------------------------------
     # Bitbucket pipeline success notification
-    # The pipeline posts here after a successful deploy so the agent knows
-    # the new image is live.  The agent just logs/acknowledges it; any
-    # pending health-check is already handled inside flow.execute_fix().
     # ------------------------------------------------------------------
     if source == "bitbucket" and body.get("status") == "success":
         return {
@@ -39,7 +44,30 @@ async def webhook(request: Request, background: BackgroundTasks):
         }
 
     # ------------------------------------------------------------------
-    # Bitbucket pipeline failure OR Grafana alert → trigger AI diagnosis
+    # Grafana unified alerting payload — extract alert summary into body
+    # Grafana sends: {"alerts": [...], "commonLabels": {...}, "externalURL": "..."}
+    # ------------------------------------------------------------------
+    if "alerts" in body:
+        firing = [a for a in body["alerts"] if a.get("status") == "firing"]
+        if not firing:
+            return {"received": True, "message": "no firing alerts"}
+        first = firing[0]
+        # Re-shape into the format handle_alert / AI expects
+        source = "grafana"
+        body = {
+            "source": "grafana",
+            "alertname": first.get("labels", {}).get("alertname", ""),
+            "severity":  first.get("labels", {}).get("severity", "high"),
+            "service":   first.get("labels", {}).get("service", "order-api"),
+            "summary":   first.get("annotations", {}).get("summary", ""),
+            "description": first.get("annotations", {}).get("description", ""),
+            "metric":    first.get("labels", {}).get("alertname", ""),
+            "value":     first.get("values", {}).get("B", ""),
+            "grafana_url": body.get("externalURL", ""),
+        }
+
+    # ------------------------------------------------------------------
+    # Grafana alert OR Bitbucket failure → trigger AI diagnosis
     # ------------------------------------------------------------------
     service_url = body.get("service_url", settings.CLOUD_RUN_SERVICE_URL)
 

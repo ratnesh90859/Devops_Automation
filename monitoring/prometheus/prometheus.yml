@@ -4,9 +4,10 @@ global:
 
 scrape_configs:
   - job_name: infra-app
+    scheme: https
     static_configs:
       - targets:
-          - infra-app:8080
+          - order-api-546580006264.asia-south1.run.app
     metrics_path: /metrics
 
   - job_name: prometheus
