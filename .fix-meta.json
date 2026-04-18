@@ -1,6 +1,8 @@
 {
-  "fix_type": "rollback",
-  "rollback_image": "786d2b35b789ad7b7ae12acc3364d582ec9b296f",
-  "incident_id": "36b7aa9f-a24f-4c53-9d1c-c8a03e01bf0b",
-  "issue_type": "deployment_regression"
+  "fix_type": "infra",
+  "fix_field": "memory",
+  "fix_old_value": "256Mi",
+  "fix_new_value": "512Mi",
+  "incident_id": "e87df0d6-e17f-4dce-b926-60f69badd3f7",
+  "issue_type": "crash"
 }
