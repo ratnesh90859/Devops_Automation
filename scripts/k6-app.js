@@ -26,7 +26,7 @@ export const options = {
     { duration: '20s', target: 0   },  // ramp down
   ],
   thresholds: {
-    http_req_duration: ['p95<35000'],  // /heavy takes ~29s
+    http_req_duration: ['p(95)<35000'],  // /heavy takes ~29s
     http_req_failed:   ['rate<0.60'],  // /crash always 500
     custom_errors:     ['rate<0.70'],
   },

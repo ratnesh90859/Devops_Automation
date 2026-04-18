@@ -25,7 +25,7 @@ export const options = {
     { duration: '30s', target: 0   },   // ramp down
   ],
   thresholds: {
-    http_req_duration:  ['p95<8000'],   // accept slow under pressure
+    http_req_duration:  ['p(95)<8000'],   // accept slow under pressure
     http_req_failed:    ['rate<0.20'],  // allow up to 20% errors (OOM kills)
     custom_errors:      ['rate<0.30'],
   },
