@@ -1,8 +1,6 @@
 {
-  "fix_type": "infra",
-  "fix_field": "memory",
-  "fix_old_value": "512Mi",
-  "fix_new_value": "1024Mi",
-  "incident_id": "3385b462-40f2-4bdc-a0a6-d04b80037cf2",
-  "issue_type": "oom"
+  "fix_type": "rollback",
+  "rollback_image": "786d2b35b789ad7b7ae12acc3364d582ec9b296f",
+  "incident_id": "36b7aa9f-a24f-4c53-9d1c-c8a03e01bf0b",
+  "issue_type": "deployment_regression"
 }
