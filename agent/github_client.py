@@ -19,22 +19,35 @@ Credentials needed (add to Cloud Run env vars):
 """
 
 import asyncio
+import os
 import httpx
 from config import settings
 
 _BASE = "https://api.github.com"
 
 
+def _token() -> str:
+    # Read directly from os.environ so a pydantic-settings default of ""
+    # never silently shadows the Cloud Run env var.
+    return os.environ.get("GITHUB_TOKEN", "") or settings.GITHUB_TOKEN
+
+
 def _headers() -> dict:
     return {
-        "Authorization": f"Bearer {settings.GITHUB_TOKEN}",
+        "Authorization": f"Bearer {_token()}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
 
 
 def _repo() -> str:
-    return f"{settings.GITHUB_OWNER}/{settings.GITHUB_REPO}"
+    owner = os.environ.get("GITHUB_OWNER", "") or settings.GITHUB_OWNER
+    repo  = os.environ.get("GITHUB_REPO",  "") or settings.GITHUB_REPO
+    return f"{owner}/{repo}"
+
+
+def _branch() -> str:
+    return os.environ.get("GITHUB_BRANCH", "") or settings.GITHUB_BRANCH or "main"
 
 
 # ---------------------------------------------------------------------------
@@ -48,7 +61,7 @@ async def get_file(file_path: str) -> str:
         r = await client.get(
             url,
             headers=_headers(),
-            params={"ref": settings.GITHUB_BRANCH},
+            params={"ref": _branch()},
         )
         r.raise_for_status()
         import base64
@@ -74,7 +87,7 @@ async def commit_file(file_path: str, new_content: str, message: str,
     Returns True on success.
     """
     import base64
-    target_branch = branch or settings.GITHUB_BRANCH
+    target_branch = branch or _branch()
     sha = await _get_file_sha(file_path, target_branch)
     url = f"{_BASE}/repos/{_repo()}/contents/{file_path}"
     payload: dict = {
@@ -121,7 +134,7 @@ async def create_branch(branch_name: str, from_branch: str | None = None) -> boo
     Create *branch_name* from *from_branch* (defaults to GITHUB_BRANCH).
     Returns True on success.
     """
-    from_ref = from_branch or settings.GITHUB_BRANCH
+    from_ref = from_branch or _branch()
     try:
         sha = await _get_branch_sha(from_ref)
     except Exception as exc:
@@ -148,7 +161,7 @@ async def create_pr(title: str, description: str, head_branch: str,
     Open a Pull Request from *head_branch* → *base_branch*.
     Returns {"id": ..., "url": ..., "number": ...} or None on failure.
     """
-    base = base_branch or settings.GITHUB_BRANCH
+    base = base_branch or _branch()
     url = f"{_BASE}/repos/{_repo()}/pulls"
     payload = {
         "title": title,
@@ -179,7 +192,7 @@ async def trigger_pipeline(branch: str | None = None) -> str:
     Returns a workflow run ID string (polled after dispatch).
     GitHub dispatch doesn't return a run ID directly, so we poll for it.
     """
-    target_branch = branch or settings.GITHUB_BRANCH
+    target_branch = branch or _branch()
     url = f"{_BASE}/repos/{_repo()}/actions/workflows/deploy.yml/dispatches"
     payload = {"ref": target_branch}
     async with httpx.AsyncClient(timeout=30) as client:
