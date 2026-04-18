@@ -16,6 +16,7 @@ Credentials needed (add to .env):
   BITBUCKET_BRANCH     - branch to commit/trigger (default: "main")
 """
 import asyncio
+import base64
 import httpx
 from config import settings
 
@@ -23,7 +24,10 @@ _BASE = "https://api.bitbucket.org/2.0"
 
 
 def _headers() -> dict:
-    return {"Authorization": f"Bearer {settings.BITBUCKET_API_TOKEN}"}
+    credentials = base64.b64encode(
+        f"{settings.BITBUCKET_USERNAME}:{settings.BITBUCKET_API_TOKEN}".encode()
+    ).decode()
+    return {"Authorization": f"Basic {credentials}"}
 
 
 def _repo() -> str:
@@ -134,3 +138,72 @@ async def wait_for_pipeline(pipeline_uuid: str, timeout: int = 600) -> bool:
         elapsed += interval
 
     return False  # timed out
+
+
+# ---------------------------------------------------------------------------
+# Branch + PR operations (PR-based approval flow)
+# ---------------------------------------------------------------------------
+
+async def create_branch(branch_name: str, from_branch: str | None = None) -> bool:
+    """
+    Create a new git branch from from_branch (defaults to BITBUCKET_BRANCH).
+    Used to create fix/* branches before committing changes and opening a PR.
+    """
+    from_ref = from_branch or settings.BITBUCKET_BRANCH
+    url = f"{_BASE}/repositories/{_repo()}/refs/branches"
+    payload = {"name": branch_name, "target": {"hash": from_ref}}
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(url, headers=_headers(), json=payload)
+        if r.status_code not in (200, 201):
+            print(f"[ERROR] create_branch {branch_name!r}: {r.status_code} {r.text[:200]}")
+            return False
+        return True
+
+
+async def commit_to_branch(branch: str, files: dict, message: str) -> bool:
+    """
+    Commit one or more files to a specific branch in a single Bitbucket API call.
+
+    files: {"path/to/file.tf": "content", ".fix-meta.json": "content", ...}
+
+    Uses the same /src multipart endpoint as commit_file but targets an
+    explicit branch instead of the default BITBUCKET_BRANCH.
+    """
+    url = f"{_BASE}/repositories/{_repo()}/src"
+    data = {"message": message, "branch": branch}
+    data.update(files)
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(url, headers=_headers(), data=data)
+        if r.status_code not in (200, 201):
+            print(f"[ERROR] commit_to_branch {branch!r}: {r.status_code} {r.text[:200]}")
+            return False
+        return True
+
+
+async def create_pr(title: str, description: str, source_branch: str,
+                    dest_branch: str | None = None) -> dict:
+    """
+    Create a pull request from source_branch → dest_branch.
+
+    Returns {"id": <int>, "url": <str>} on success, {} on failure.
+    The PR is configured to auto-close the source branch on merge.
+    """
+    dest = dest_branch or settings.BITBUCKET_BRANCH
+    url = f"{_BASE}/repositories/{_repo()}/pullrequests"
+    payload = {
+        "title": title,
+        "description": description,
+        "source": {"branch": {"name": source_branch}},
+        "destination": {"branch": {"name": dest}},
+        "close_source_branch": True,
+    }
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(url, headers=_headers(), json=payload)
+        if r.status_code in (200, 201):
+            data = r.json()
+            return {
+                "id":  data["id"],
+                "url": data["links"]["html"]["href"],
+            }
+        print(f"[ERROR] create_pr failed: {r.status_code} {r.text[:300]}")
+        return {}

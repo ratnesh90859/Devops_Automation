@@ -1,5 +1,5 @@
 from flask import Flask, jsonify, request, Response
-import os, time, psutil, logging, json as _json
+import os, time, psutil, logging, json as _json, threading, urllib.request as _urllib_req
 from prometheus_client import (
     Counter, Histogram, Gauge,
     generate_latest, CONTENT_TYPE_LATEST
@@ -30,6 +30,140 @@ def log_biz(msg: str, **kw):
 # or call POST /admin/disable-heavy to disable without redeploying.
 _heavy_enabled = os.getenv("HEAVY_ENABLED", "true").lower() != "false"
 _ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "infraguard-secret-2026")
+
+# ── Threshold Monitor ─────────────────────────────────────────────────────────
+# Counters start at ZERO on every app boot. When a counter reaches its
+# configured limit the system POSTs an alert to the AI agent which will
+# diagnose the issue, suggest a fix, and prompt for approval on Telegram.
+
+_threshold_lock   = threading.Lock()
+_COOLDOWN_UNTIL   = 0.0   # Unix timestamp — suppress duplicate alerts before this
+_COOLDOWN_SECS    = int(os.getenv("THRESHOLD_COOLDOWN_SECS", "120"))
+_AGENT_WEBHOOK    = os.getenv("AGENT_WEBHOOK_URL", "")
+_WEBHOOK_SECRET   = os.getenv("WEBHOOK_SECRET", "")
+_app_start_time   = time.time()   # used to compute uptime in alert payloads
+
+_THRESHOLDS: dict = {
+    "total_requests": {
+        "count": 0,
+        "limit": int(os.getenv("THRESHOLD_REQUESTS", "100")),
+        "fired": False,
+        "severity": "medium",
+        "description": "Total HTTP request volume has exceeded the configured threshold.",
+    },
+    "total_errors": {
+        "count": 0,
+        "limit": int(os.getenv("THRESHOLD_ERRORS", "10")),
+        "fired": False,
+        "severity": "high",
+        "description": "5xx error count has exceeded the configured threshold.",
+    },
+}
+
+
+def _post_alert_background(payload: dict) -> None:
+    """Fire the threshold alert payload to the agent webhook in a daemon thread."""
+    if not _AGENT_WEBHOOK:
+        log_infra("threshold_no_webhook_configured", payload=str(payload)[:200])
+        return
+
+    def _send():
+        try:
+            data = _json.dumps(payload).encode()
+            req  = _urllib_req.Request(
+                f"{_AGENT_WEBHOOK}/webhook",
+                data=data,
+                headers={"Content-Type": "application/json", "X-Token": _WEBHOOK_SECRET},
+                method="POST",
+            )
+            with _urllib_req.urlopen(req, timeout=10):
+                pass
+            log_infra(
+                "threshold_alert_fired",
+                metric=payload["metric"],
+                value=payload["value"],
+                limit=payload["threshold"],
+            )
+        except Exception as exc:
+            log_infra("threshold_alert_failed", metric=payload.get("metric"), error=str(exc))
+
+    threading.Thread(target=_send, daemon=True).start()
+
+
+def _increment_threshold(key: str) -> None:
+    """Increment a named counter and fire to the agent when its limit is reached."""
+    global _COOLDOWN_UNTIL
+    with _threshold_lock:
+        entry = _THRESHOLDS[key]
+        entry["count"] += 1
+        current = entry["count"]
+        limit   = entry["limit"]
+        if entry["fired"] or current < limit:
+            return  # nothing to do yet
+        # Threshold crossed — check cooldown then fire
+        now = time.time()
+        if now < _COOLDOWN_UNTIL:
+            return  # still in cooldown
+        entry["fired"]  = True
+        _COOLDOWN_UNTIL = now + _COOLDOWN_SECS
+
+    # Build and dispatch the alert (outside the lock to avoid blocking requests)
+    # Collect a snapshot of recent structured logs for all three layers so the
+    # AI agent can correlate across infrastructure / application / business events.
+    def _collect_recent_logs(n: int = 30) -> dict:
+        """Grab the last N lines from each log layer printed to stdout."""
+        # In production (Cloud Run) these are read by the agent via GCP Logging.
+        # Here we surface basic counters that are always available in-process.
+        mem_mb  = round(psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024, 1)
+        uptime  = round(time.time() - _app_start_time, 0)
+        return {
+            "infra_snapshot":    (
+                f"[INFRA] memory_current_mb={mem_mb} "
+                f"uptime_secs={uptime} "
+                f"total_requests={_THRESHOLDS['total_requests']['count']} "
+                f"total_errors={_THRESHOLDS['total_errors']['count']}"
+            ),
+            "app_snapshot":      (
+                f"[APP] error_rate={round(entry['count'] / max(_THRESHOLDS['total_requests']['count'], 1) * 100, 1)}% "
+                f"errors={_THRESHOLDS['total_errors']['count']} "
+                f"requests={_THRESHOLDS['total_requests']['count']}"
+            ),
+            "business_snapshot": (
+                f"[BIZ] orders_affected={_THRESHOLDS['total_errors']['count']} "
+                f"service_degraded={'true' if _THRESHOLDS['total_errors']['count'] >= 5 else 'false'} "
+                f"heavy_enabled={_heavy_enabled}"
+            ),
+        }
+
+    snapshots = _collect_recent_logs()
+    payload = {
+        "source":            "threshold_monitor",
+        "alertname":         f"{key}_threshold_breached",
+        "severity":          entry["severity"],
+        "service":           "order-api",
+        "metric":            key,
+        "value":             str(current),
+        "threshold":         str(limit),
+        "summary":           f"{key} reached {current} (threshold: {limit})",
+        "description": (
+            f"{entry['description']} "
+            f"Counter: {current}/{limit}. "
+            f"Automatic AI diagnosis and fix suggestion have been triggered."
+        ),
+        # Rich context for cross-layer AI correlation
+        "infra_logs":        snapshots["infra_snapshot"],
+        "app_logs":          snapshots["app_snapshot"],
+        "business_logs":     snapshots["business_snapshot"],
+        "memory_mb":         round(psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024, 1),
+        "total_requests":    _THRESHOLDS["total_requests"]["count"],
+        "total_errors":      _THRESHOLDS["total_errors"]["count"],
+        "error_rate_pct":    round(
+            _THRESHOLDS["total_errors"]["count"] /
+            max(_THRESHOLDS["total_requests"]["count"], 1) * 100, 1
+        ),
+    }
+    log_infra("threshold_breached", key=key, count=current, limit=limit)
+    _post_alert_background(payload)
 
 app = Flask(__name__)
 
@@ -76,8 +210,12 @@ def record_metrics(response):
         ERROR_TOTAL.labels(endpoint=ep).inc()
         log_app("http_error", endpoint=ep, status=response.status_code,
                 latency_s=round(latency, 3))
+        _increment_threshold("total_errors")
     elif latency > 2.0:
         log_app("slow_request", endpoint=ep, latency_s=round(latency, 3))
+    # Count every request (skip internal /metrics and /health probes)
+    if ep not in ("/metrics", "/health"):
+        _increment_threshold("total_requests")
     return response
 
 @app.errorhandler(Exception)
@@ -241,10 +379,18 @@ def reset():
     - Resets LOAD_SIZE and SLEEP_SECONDS env overrides to defaults
     Call this before retesting any scenario.
     """
-    global _leak_store, _heavy_enabled
+    global _leak_store, _heavy_enabled, _COOLDOWN_UNTIL
     cleared_items = len(_leak_store)
     _leak_store = []
     _heavy_enabled = True
+
+    # Also reset threshold counters so the demo can start fresh
+    with _threshold_lock:
+        for v in _THRESHOLDS.values():
+            v["count"] = 0
+            v["fired"] = False
+    _COOLDOWN_UNTIL = 0.0
+    log_infra("thresholds_reset_via_reset_endpoint")
 
     import gc
     gc.collect()
@@ -256,13 +402,286 @@ def reset():
         "cleared_leak_items": cleared_items,
         "heavy_enabled": True,
         "memory_after_mb": mem_after,
-        "message": "All simulated issues cleared. Ready to retest.",
+        "thresholds_reset": True,
+        "message": "All simulated issues cleared and threshold counters reset. Ready to retest.",
     })
 
 
 @app.route("/metrics")
 def metrics():
     return Response(generate_latest(), mimetype=CONTENT_TYPE_LATEST)
+
+
+# ── Threshold admin endpoints ──────────────────────────────────────────────────
+
+@app.route("/admin/thresholds")
+def get_thresholds():
+    """Live view of all threshold counters. Shows progress toward each limit."""
+    if not _check_admin_token():
+        return jsonify({"error": "unauthorized"}), 401
+    with _threshold_lock:
+        result = {}
+        for k, v in _THRESHOLDS.items():
+            pct = round((v["count"] / v["limit"]) * 100, 1) if v["limit"] > 0 else 0
+            result[k] = {
+                "count":    v["count"],
+                "limit":    v["limit"],
+                "progress": f"{v['count']}/{v['limit']}",
+                "percent":  pct,
+                "fired":    v["fired"],
+                "severity": v["severity"],
+            }
+        result["cooldown_remaining_secs"] = max(0, round(_COOLDOWN_UNTIL - time.time(), 1))
+    return jsonify(result)
+
+
+@app.route("/admin/reset-thresholds", methods=["POST"])
+def reset_thresholds():
+    """Reset all threshold counters and cooldown back to zero."""
+    global _COOLDOWN_UNTIL
+    if not _check_admin_token():
+        return jsonify({"error": "unauthorized"}), 401
+    with _threshold_lock:
+        for v in _THRESHOLDS.values():
+            v["count"] = 0
+            v["fired"] = False
+    _COOLDOWN_UNTIL = 0.0
+    log_infra("thresholds_reset_manual")
+    return jsonify({
+        "reset": True,
+        "thresholds": {k: {"count": 0, "limit": v["limit"]} for k, v in _THRESHOLDS.items()},
+    })
+
+
+# ── Demo Engine ────────────────────────────────────────────────────────────────
+# A background thread that hammers the app's own endpoints to create real load.
+# Triggered via POST /demo/start; stopped via POST /demo/stop.
+#
+# Scenario progression per run:
+#   Phase 1 – Warm-up   : hits /orders (normal traffic)
+#   Phase 2 – Stress    : hits /heavy (memory pressure) + /crash (5xx errors)
+#   Phase 3 – Leak      : hits /leak  (gradual memory growth)
+# The threshold fires either on total_requests or total_errors depending on
+# which limit is reached first.  Both counters are logged in real time.
+
+_demo_lock    = threading.Lock()
+_demo_running = False
+_demo_thread: threading.Thread | None = None
+_demo_engine: "_DemoScenario | None" = None
+_demo_stats: dict = {}
+
+
+class _DemoScenario:
+    """Encapsulates one complete load-generation run."""
+
+    SCENARIOS = {
+        "crash":  {"endpoints": ["/crash"],          "label": "5xx error burst",    "mix": "errors"},
+        "memory": {"endpoints": ["/heavy", "/leak"],  "label": "memory pressure",    "mix": "memory"},
+        "slow":   {"endpoints": ["/slow"],            "label": "high latency",       "mix": "latency"},
+        "mixed":  {"endpoints": ["/orders", "/heavy", "/crash", "/leak"],
+                   "label": "mixed realistic load", "mix": "mixed"},
+    }
+
+    def __init__(self, scenario: str, target_url: str, req_delay: float, error_threshold: int, req_threshold: int):
+        self.scenario    = self.SCENARIOS.get(scenario, self.SCENARIOS["mixed"])
+        self.target_url  = target_url.rstrip("/")
+        self.req_delay   = req_delay    # seconds between each request
+        self.err_limit   = error_threshold
+        self.req_limit   = req_threshold
+        self.sent        = 0
+        self.errors      = 0
+        self.start_time  = time.time()
+        self._stop       = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        global _demo_running, _demo_stats
+        endpoints  = self.scenario["endpoints"]
+        mix        = self.scenario["mix"]
+        idx        = 0
+
+        log_infra("demo_started",
+                  scenario=self.scenario["label"],
+                  target=self.target_url,
+                  error_threshold=self.err_limit,
+                  req_threshold=self.req_limit)
+        log_biz("demo_load_generator_activated",
+                scenario=self.scenario["label"],
+                estimated_requests_to_threshold=self.req_limit)
+
+        while not self._stop:
+            ep = endpoints[idx % len(endpoints)]
+            idx += 1
+            try:
+                url = self.target_url + ep
+                req = _urllib_req.Request(url, method="GET")
+                with _urllib_req.urlopen(req, timeout=15) as resp:
+                    status = resp.status
+            except Exception as exc:
+                # urllib raises HTTPError for 4xx/5xx status codes
+                status = getattr(exc, "code", 0)
+
+            self.sent += 1
+            if isinstance(status, int) and status >= 500:
+                self.errors += 1
+
+            _demo_stats.update({
+                "sent":          self.sent,
+                "errors":        self.errors,
+                "elapsed_secs":  round(time.time() - self.start_time, 1),
+                "last_endpoint": ep,
+                "last_status":   status,
+                "threshold_reqs": self.req_limit,
+                "threshold_errs": self.err_limit,
+                "progress_reqs": f"{self.sent}/{self.req_limit}",
+                "progress_errs": f"{self.errors}/{self.err_limit}",
+            })
+
+            # Friendly progress log every 10 requests
+            if self.sent % 10 == 0:
+                log_infra("demo_progress",
+                          sent=self.sent, errors=self.errors,
+                          req_pct=round(self.sent / self.req_limit * 100, 1),
+                          err_pct=round(self.errors / self.err_limit * 100, 1))
+                log_biz("load_test_in_progress",
+                        requests_sent=self.sent,
+                        errors=self.errors,
+                        phase="stress" if self.sent > self.req_limit * 0.3 else "warmup")
+
+            # Stop if BOTH thresholds already fired (no point continuing)
+            with _threshold_lock:
+                all_fired = all(v["fired"] for v in _THRESHOLDS.values())
+            if all_fired:
+                log_infra("demo_thresholds_all_fired", sent=self.sent, errors=self.errors)
+                log_biz("demo_complete_alert_fired",
+                        total_requests=self.sent,
+                        total_errors=self.errors)
+                break
+
+            time.sleep(self.req_delay)
+
+        _demo_running = False
+        log_infra("demo_stopped", sent=self.sent, errors=self.errors,
+                  elapsed=round(time.time() - self.start_time, 1))
+
+
+@app.route("/demo/start", methods=["POST"])
+def demo_start():
+    """
+    Start the automated load generator.
+
+    Body (all optional):
+      {
+        "scenario":         "mixed|crash|memory|slow",  // default: mixed
+        "delay_secs":       0.3,    // pause between requests (default: 0.3s)
+        "target_url":       "...",  // self (default: http://localhost:8080)
+        "error_threshold":  10,     // override THRESHOLD_ERRORS
+        "req_threshold":    100     // override THRESHOLD_REQUESTS
+      }
+    """
+    global _demo_running, _demo_thread, _demo_stats, _demo_engine
+
+    if not _check_admin_token():
+        return jsonify({"error": "unauthorized"}), 401
+
+    with _demo_lock:
+        if _demo_running:
+            return jsonify({"error": "demo already running", "stats": _demo_stats}), 409
+
+        body          = request.get_json(silent=True) or {}
+        scenario      = body.get("scenario", "mixed")
+        delay         = float(body.get("delay_secs", 0.3))
+        target_url    = body.get("target_url", f"http://localhost:{os.getenv('PORT', '8080')}")
+        err_threshold = int(body.get("error_threshold",
+                                     _THRESHOLDS["total_errors"]["limit"]))
+        req_threshold = int(body.get("req_threshold",
+                                     _THRESHOLDS["total_requests"]["limit"]))
+
+        # Reset counters so the demo always starts from zero
+        with _threshold_lock:
+            for v in _THRESHOLDS.values():
+                v["count"] = 0
+                v["fired"] = False
+        global _COOLDOWN_UNTIL
+        _COOLDOWN_UNTIL = 0.0
+
+        _demo_stats   = {"status": "running", "sent": 0, "errors": 0}
+        _demo_running = True
+
+        _demo_engine  = _DemoScenario(scenario, target_url, delay, err_threshold, req_threshold)
+        _demo_thread  = threading.Thread(target=_demo_engine.run, daemon=True,
+                                         name="demo-load-generator")
+        _demo_thread.start()
+
+        log_infra("demo_engine_launched",
+                  scenario=scenario, delay=delay, target=target_url)
+        log_biz("enterprise_demo_started",
+                scenario=scenario,
+                req_threshold=req_threshold,
+                err_threshold=err_threshold,
+                message="Load generator active — alert will fire on threshold breach")
+
+    return jsonify({
+        "status":          "started",
+        "scenario":        scenario,
+        "target_url":      target_url,
+        "delay_secs":      delay,
+        "req_threshold":   req_threshold,
+        "error_threshold": err_threshold,
+        "message": (
+            f"Load generator running. "
+            f"Alert fires after {req_threshold} requests OR {err_threshold} errors. "
+            f"Watch Telegram for the incident report."
+        ),
+    })
+
+
+@app.route("/demo/stop", methods=["POST"])
+def demo_stop():
+    """Stop the running load generator."""
+    global _demo_running, _demo_thread, _demo_engine
+    if not _check_admin_token():
+        return jsonify({"error": "unauthorized"}), 401
+
+    with _demo_lock:
+        if not _demo_running:
+            return jsonify({"status": "not_running", "stats": _demo_stats})
+        if _demo_engine:
+            _demo_engine.stop()   # tells the run loop to exit on next iteration
+        _demo_running = False
+        if _demo_thread:
+            _demo_thread.join(timeout=2)
+
+    log_infra("demo_stopped_via_api")
+    return jsonify({"status": "stopped", "final_stats": _demo_stats})
+
+
+@app.route("/demo/status")
+def demo_status():
+    """Live status of the load generator and threshold counters."""
+    with _threshold_lock:
+        thresholds = {
+            k: {
+                "count":    v["count"],
+                "limit":    v["limit"],
+                "progress": f"{v['count']}/{v['limit']}",
+                "percent":  round(v["count"] / v["limit"] * 100, 1) if v["limit"] else 0,
+                "fired":    v["fired"],
+            }
+            for k, v in _THRESHOLDS.items()
+        }
+        cooldown_secs = max(0, round(_COOLDOWN_UNTIL - time.time(), 1))
+
+    return jsonify({
+        "demo_running":   _demo_running,
+        "stats":          _demo_stats,
+        "thresholds":     thresholds,
+        "cooldown_remaining_secs": cooldown_secs,
+        "agent_webhook":  bool(_AGENT_WEBHOOK),
+    })
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)

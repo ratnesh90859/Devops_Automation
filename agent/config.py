@@ -13,16 +13,22 @@ class Settings(BaseSettings):
     BASE_URL: str
     TERRAFORM_DIR: str = "/app/terraform"
 
-    # Bitbucket — required for code-level fixes pushed via pipeline
-    # Create an API token at: https://id.atlassian.com/manage-profile/security/api-tokens
-    # Token scopes needed: Repositories (read/write), Pipelines (read/write)
-    BITBUCKET_WORKSPACE: str = ""
-    BITBUCKET_REPO_SLUG: str = ""
-    BITBUCKET_API_TOKEN: str = ""
-    BITBUCKET_BRANCH: str = "main"
+    # GitHub — required for code-level fixes pushed via Actions workflow
+    # Create a PAT at: https://github.com/settings/tokens
+    # Token scopes needed: repo (full), workflow
+    GITHUB_OWNER: str = ""
+    GITHUB_REPO: str = ""
+    GITHUB_TOKEN: str = ""
+    GITHUB_BRANCH: str = "main"
 
     # Loki — local only (docker-compose); leave empty for Cloud Run
     LOKI_URL: str = ""
+
+    # Threshold monitor — infra-app uses these same values via env vars.
+    # Documented here for reference; the agent reads them through the alert payload.
+    # THRESHOLD_REQUESTS=100   (fire after N non-health/metrics requests)
+    # THRESHOLD_ERRORS=10      (fire after N 5xx responses)
+    # THRESHOLD_COOLDOWN_SECS=120  (min seconds between consecutive alerts)
 
     class Config:
         env_file = ".env"

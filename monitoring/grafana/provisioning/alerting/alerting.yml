@@ -1,7 +1,206 @@
 apiVersion: 1
 
+# ── Alert Rule Groups ──────────────────────────────────────────────────────────
+# Unified alerting rules evaluated by Grafana every 1 minute.
+# datasourceUid must match the actual Prometheus datasource UID.
+groups:
+  - orgId: 1
+    name: order-api-alerts
+    folder: InfraAlerts
+    interval: 10s
+    rules:
+
+      # Fires when error rate > 0.1 errors/sec for 30s
+      # At 3 crashes/sec this fires within ~1 minute of load test start
+      - uid: high-error-rate-rule
+        title: High Error Rate
+        condition: C
+        data:
+          - refId: A
+            datasourceUid: PBFA97CFB590B2093
+            queryType: ""
+            relativeTimeRange:
+              from: 300
+              to: 0
+            model:
+              expr: "sum(rate(http_errors_total[1m]))"
+              refId: A
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: B
+            datasourceUid: "__expr__"
+            queryType: ""
+            relativeTimeRange:
+              from: 0
+              to: 0
+            model:
+              type: reduce
+              refId: B
+              expression: A
+              reducer: last
+              settings:
+                mode: ""
+          - refId: C
+            datasourceUid: "__expr__"
+            queryType: ""
+            relativeTimeRange:
+              from: 0
+              to: 0
+            model:
+              type: threshold
+              refId: C
+              expression: B
+              conditions:
+                - type: query
+                  evaluator:
+                    type: gt
+                    params: [0.1]
+                  operator:
+                    type: and
+                  query:
+                    params: [B]
+                  reducer:
+                    type: last
+                    params: []
+        noDataState: NoData
+        execErrState: Alerting
+        for: 30s
+        annotations:
+          summary: "Error rate above 0.1/s on order-api"
+          description: "High error rate detected — automated AI fix incoming"
+        labels:
+          service: order-api
+          severity: high
+          alertname: HighErrorRate
+        isPaused: false
+
+      # Fires when p95 latency > 3s for 1m (triggered by /slow endpoint)
+      - uid: high-latency-rule
+        title: High Latency
+        condition: C
+        data:
+          - refId: A
+            datasourceUid: PBFA97CFB590B2093
+            queryType: ""
+            relativeTimeRange:
+              from: 300
+              to: 0
+            model:
+              expr: "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[1m])) by (le))"
+              refId: A
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: B
+            datasourceUid: "__expr__"
+            queryType: ""
+            relativeTimeRange:
+              from: 0
+              to: 0
+            model:
+              type: reduce
+              refId: B
+              expression: A
+              reducer: last
+              settings:
+                mode: ""
+          - refId: C
+            datasourceUid: "__expr__"
+            queryType: ""
+            relativeTimeRange:
+              from: 0
+              to: 0
+            model:
+              type: threshold
+              refId: C
+              expression: B
+              conditions:
+                - type: query
+                  evaluator:
+                    type: gt
+                    params: [3]
+                  operator:
+                    type: and
+                  query:
+                    params: [B]
+                  reducer:
+                    type: last
+                    params: []
+        noDataState: NoData
+        execErrState: Alerting
+        for: 1m
+        annotations:
+          summary: "p95 latency above 3s on order-api"
+          description: "High latency detected — automated AI fix incoming"
+        labels:
+          service: order-api
+          severity: high
+          alertname: HighLatency
+        isPaused: false
+
+      # Fires when memory > 200MB for 1m (triggered by /leak endpoint)
+      - uid: high-memory-rule
+        title: High Memory
+        condition: C
+        data:
+          - refId: A
+            datasourceUid: PBFA97CFB590B2093
+            queryType: ""
+            relativeTimeRange:
+              from: 300
+              to: 0
+            model:
+              expr: "app_memory_usage_bytes / 1024 / 1024"
+              refId: A
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: B
+            datasourceUid: "__expr__"
+            queryType: ""
+            relativeTimeRange:
+              from: 0
+              to: 0
+            model:
+              type: reduce
+              refId: B
+              expression: A
+              reducer: last
+              settings:
+                mode: ""
+          - refId: C
+            datasourceUid: "__expr__"
+            queryType: ""
+            relativeTimeRange:
+              from: 0
+              to: 0
+            model:
+              type: threshold
+              refId: C
+              expression: B
+              conditions:
+                - type: query
+                  evaluator:
+                    type: gt
+                    params: [200]
+                  operator:
+                    type: and
+                  query:
+                    params: [B]
+                  reducer:
+                    type: last
+                    params: []
+        noDataState: NoData
+        execErrState: Alerting
+        for: 1m
+        annotations:
+          summary: "Memory above 200MB on order-api"
+          description: "High memory detected — automated AI fix incoming"
+        labels:
+          service: order-api
+          severity: high
+          alertname: HighMemory
+        isPaused: false
+
 # ── Contact Points ─────────────────────────────────────────────────────────────
-# Grafana sends alert webhooks to infra-agent /webhook endpoint
 contactPoints:
   - orgId: 1
     name: infra-agent-webhook
@@ -11,23 +210,14 @@ contactPoints:
         settings:
           url: https://infra-agent-546580006264.asia-south1.run.app/webhook
           httpMethod: POST
-          # Include all alert labels and annotations in the payload
           maxAlerts: 0
         disableResolveMessage: false
 
 # ── Notification Policies ──────────────────────────────────────────────────────
-# All alerts → infra-agent-webhook
 policies:
   - orgId: 1
     receiver: infra-agent-webhook
     group_by: ["alertname", "service"]
-    group_wait: 10s
-    group_interval: 1m
+    group_wait: 5s
+    group_interval: 30s
     repeat_interval: 4h
-    routes:
-      - receiver: infra-agent-webhook
-        matchers:
-          - service = order-api
-        group_wait: 5s
-        group_interval: 30s
-        repeat_interval: 2h

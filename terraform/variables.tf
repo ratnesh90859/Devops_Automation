@@ -74,3 +74,35 @@ variable "state_bucket_location" {
   type        = string
   default     = "ASIA-SOUTH1"
 }
+
+# ── Threshold Monitor ─────────────────────────────────────────────────────────
+variable "agent_webhook_url" {
+  description = "Base URL of the infra-agent service (used by order-api threshold monitor)."
+  type        = string
+  default     = ""
+}
+
+variable "webhook_secret" {
+  description = "Shared secret for the /webhook endpoint (X-Token header)."
+  type        = string
+  default     = ""
+  sensitive   = true
+}
+
+variable "threshold_requests" {
+  description = "Fire a threshold alert after this many total HTTP requests (resets on restart)."
+  type        = number
+  default     = 100
+}
+
+variable "threshold_errors" {
+  description = "Fire a threshold alert after this many 5xx responses (resets on restart)."
+  type        = number
+  default     = 10
+}
+
+variable "threshold_cooldown_secs" {
+  description = "Minimum seconds between consecutive threshold alerts to prevent spam."
+  type        = number
+  default     = 120
+}

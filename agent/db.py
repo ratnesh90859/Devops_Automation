@@ -47,7 +47,60 @@ def list_incidents() -> list:
     return [_doc_to_dict(d) for d in docs]
 
 
-# No SQL setup needed — Firestore creates the collection automatically
+# ── Deployment tracking ───────────────────────────────────────────────────────
+# Records every successful pipeline deploy. Used for deployment regression
+# detection: if an alert fires within 30 min of a deploy, it's likely a regression.
+
+_dep_col = _db.collection("deployments")
+
+
+def track_deployment(commit_id: str, image_tag: str,
+                     fix_type: str = "app", incident_id: str = "") -> dict:
+    """Record a successful deployment (called from webhook on pipeline success)."""
+    dep_id = str(uuid.uuid4())
+    data = {
+        "commit_id":   commit_id,
+        "image_tag":   image_tag,
+        "fix_type":    fix_type,
+        "incident_id": incident_id,
+        "deployed_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _dep_col.document(dep_id).set(data)
+    data["id"] = dep_id
+    return data
+
+
+def get_latest_deployment() -> dict | None:
+    """Return the most recent successful deployment record."""
+    docs = list(
+        _dep_col
+        .order_by("deployed_at", direction=firestore.Query.DESCENDING)
+        .limit(1)
+        .stream()
+    )
+    if not docs:
+        return None
+    d = docs[0].to_dict()
+    d["id"] = docs[0].id
+    return d
+
+
+def get_previous_deployment() -> dict | None:
+    """Return the deployment immediately before the latest one (used for rollback target)."""
+    docs = list(
+        _dep_col
+        .order_by("deployed_at", direction=firestore.Query.DESCENDING)
+        .limit(2)
+        .stream()
+    )
+    if len(docs) < 2:
+        return None
+    d = docs[1].to_dict()
+    d["id"] = docs[1].id
+    return d
+
+
+# No SQL setup needed — Firestore creates collections automatically
 # on first write. No schema, no migrations.
 #
 # Firestore path: projects/<GCP_PROJECT_ID>/databases/(default)/documents/incidents/<uuid>

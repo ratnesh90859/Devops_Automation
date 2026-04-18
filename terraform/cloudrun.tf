@@ -61,6 +61,35 @@ resource "google_cloud_run_v2_service" "order_api" {
         value = "8"
       }
 
+      # ── Threshold Monitor ────────────────────────────────────────────
+      # The app counts every request from zero. When total_requests hits
+      # THRESHOLD_REQUESTS (default 100) or total_errors hits
+      # THRESHOLD_ERRORS (default 10) it POSTs an alert to the AI agent.
+      env {
+        name  = "AGENT_WEBHOOK_URL"
+        value = var.agent_webhook_url
+      }
+
+      env {
+        name  = "WEBHOOK_SECRET"
+        value = var.webhook_secret
+      }
+
+      env {
+        name  = "THRESHOLD_REQUESTS"
+        value = tostring(var.threshold_requests)
+      }
+
+      env {
+        name  = "THRESHOLD_ERRORS"
+        value = tostring(var.threshold_errors)
+      }
+
+      env {
+        name  = "THRESHOLD_COOLDOWN_SECS"
+        value = tostring(var.threshold_cooldown_secs)
+      }
+
       liveness_probe {
         http_get {
           path = "/"

@@ -36,6 +36,23 @@ async def webhook(request: Request, background: BackgroundTasks):
     # Bitbucket pipeline success notification
     # ------------------------------------------------------------------
     if source == "bitbucket" and body.get("status") == "success":
+        # Track this deployment for regression detection.
+        # The pipeline sends fix_meta (type/incident_id) + commit + image_tag.
+        try:
+            from db import track_deployment
+            fix_meta  = body.get("fix_meta") or {}
+            commit_id = body.get("commit", "unknown")
+            image_tag = body.get("image_tag", commit_id)
+            track_deployment(
+                commit_id=commit_id,
+                image_tag=image_tag,
+                fix_type=fix_meta.get("fix_type", "app"),
+                incident_id=fix_meta.get("incident_id", ""),
+            )
+            print(f"[INFO] Deployment tracked: commit={commit_id[:10]} fix_type={fix_meta.get('fix_type','app')}")
+        except Exception as _dep_exc:
+            print(f"[WARN] track_deployment failed: {_dep_exc}")
+
         return {
             "received": True,
             "message": "pipeline success acknowledged",
@@ -62,7 +79,7 @@ async def webhook(request: Request, background: BackgroundTasks):
             "summary":   first.get("annotations", {}).get("summary", ""),
             "description": first.get("annotations", {}).get("description", ""),
             "metric":    first.get("labels", {}).get("alertname", ""),
-            "value":     first.get("values", {}).get("B", ""),
+            "value":     (first.get("values") or {}).get("B", first.get("valueString", "")),
             "grafana_url": body.get("externalURL", ""),
         }
 
@@ -424,13 +441,12 @@ async def correlate(req: CorrelateRequest):
 
 async def _send_correlation_report(report: dict):
     """Send correlation report to Telegram."""
-    from telegram_bot import bot, _esc
-    from config import settings
+    from telegram_bot import _safe_send, _esc
     def _e(val) -> str:
         return _esc(str(val)) if val else "N/A"
 
     chain = "\n".join(
-        f"  {i+1}\\. {_e(s)}" for i, s in enumerate(report.get("causal_chain") or [])
+        f"  {i+1}. {_e(s)}" for i, s in enumerate(report.get("causal_chain") or [])
     )
     inf_ev = "\n".join(f"  • {_e(e)}" for e in (report.get("infra_evidence") or []))
     app_ev = "\n".join(f"  • {_e(e)}" for e in (report.get("app_evidence") or []))
@@ -444,7 +460,7 @@ async def _send_correlation_report(report: dict):
     )
 
     text = (
-        f"🔗 *Cross\\-Layer Correlation Report*\n\n"
+        f"🔗 *Cross-Layer Correlation Report*\n\n"
         f"*Root Layer:* {root_icon} {_e(report.get('root_layer')).upper()}\n"
         f"*Infra Issue:* {_e(report.get('infra_issue'))}\n"
         f"*App Issue:* {_e(report.get('app_issue'))}\n\n"
@@ -457,19 +473,159 @@ async def _send_correlation_report(report: dict):
         f"*Business Impact:*\n{_e(report.get('business_impact'))}\n\n"
         f"*Fix:*\n"
         f"  ⚡ Immediate: {_e(report.get('immediate_fix'))}\n"
-        f"  🔧 Long\\-term: {_e(report.get('longterm_fix'))}\n\n"
+        f"  🔧 Long-term: {_e(report.get('longterm_fix'))}\n\n"
         f"*Prevention:*\n{prev}\n\n"
         f"*Confidence:* {conf_icon} {conf} — {_e(report.get('confidence_reason'))}"
     )
 
+    await _safe_send(text=text, parse_mode="Markdown")
+
+
+# ── Demo (end-to-end auto flow) ───────────────────────────────────────────────
+# POST /demo/start  → wakes up the infra-app load generator so requests build
+#                     up from zero.  When the threshold is crossed the infra-app
+#                     POSTs to /webhook here, which triggers AI diagnosis +
+#                     Telegram alert + approval flow automatically.
+# POST /demo/stop   → stop the load generator early
+# GET  /demo/status → live counters + incident list
+
+class DemoStartRequest(BaseModel):
+    scenario:         Optional[str]   = "mixed"   # mixed | crash | memory | slow
+    delay_secs:       Optional[float] = 0.3       # pause between fake requests
+    req_threshold:    Optional[int]   = None      # override app default (100)
+    error_threshold:  Optional[int]   = None      # override app default (10)
+    service_url:      Optional[str]   = None      # infra-app base URL (defaults to CLOUD_RUN_SERVICE_URL)
+
+
+@api.post("/demo/start")
+async def demo_start(req: DemoStartRequest, background: BackgroundTasks):
+    """
+    One-click enterprise demo:
+
+    1. Hits the infra-app /demo/start to launch the load generator
+    2. The load generator fires real requests against its own endpoints
+       (/orders, /heavy, /crash, /leak) — counters start from zero
+    3. When total_requests OR total_errors hits its threshold, the
+       infra-app POSTs an alert to this agent's /webhook
+    4. The agent runs AI diagnosis (fast + deep) in parallel
+    5. A Telegram message is sent:
+         • Issue type, severity, confidence, root cause
+         • Proposed fix (infra Terraform change or code push)
+         • [✅ Apply Fix] / [❌ Reject] buttons
+    6. You click ✅ and type your reason → fix is applied automatically
+    7. After fix: post-mortem report with full cross-layer log correlation
+    """
+    import httpx
+    service_url = req.service_url or settings.CLOUD_RUN_SERVICE_URL
+
+    payload: dict = {
+        "scenario":   req.scenario,
+        "delay_secs": req.delay_secs,
+        # tell infra-app to call back THIS agent (not the order-api itself)
+        "target_url": settings.BASE_URL,
+    }
+    if req.req_threshold is not None:
+        payload["req_threshold"]   = req.req_threshold
+    if req.error_threshold is not None:
+        payload["error_threshold"] = req.error_threshold
+
     try:
-        await bot.send_message(
-            chat_id=settings.TELEGRAM_CHAT_ID,
-            text=text,
-            parse_mode="MarkdownV2",
-        )
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.post(
+                f"{service_url}/demo/start",
+                json=payload,
+                headers={"X-Admin-Token": "infraguard-secret-2026"},
+            )
+            r.raise_for_status()
+            app_response = r.json()
     except Exception as exc:
-        print(f"[ERROR] _send_correlation_report: {exc}")
+        raise HTTPException(status_code=502, detail=f"Could not start demo on infra-app: {exc}")
+
+    # Also notify Telegram that the demo has started
+    async def _notify():
+        try:
+            from telegram_bot import _safe_send, _esc
+            scenario = _esc(req.scenario or "mixed")
+            rth       = _esc(str(app_response.get("req_threshold", "100")))
+            eth       = _esc(str(app_response.get("error_threshold", "10")))
+            delay     = _esc(str(req.delay_secs))
+            await _safe_send(
+                text=(
+                    f"🚦 *Enterprise Demo Started*\n\n"
+                    f"*Scenario:* `{scenario}`\n"
+                    f"*Request threshold:* {rth} requests\n"
+                    f"*Error threshold:* {eth} errors\n"
+                    f"*Request delay:* {delay}s\n\n"
+                    f"Counters are now at *zero* and climbing.\n"
+                    f"When the threshold is breached the AI agent will:\n"
+                    f"  1. Diagnose the issue\n"
+                    f"  2. Send a fix proposal here\n"
+                    f"  3. Wait for your approval + reason\n"
+                    f"  4. Apply the fix automatically\n"
+                    f"  5. Send a post-mortem correlation report\n\n"
+                    f"_Watch this chat._"
+                ),
+                parse_mode="Markdown",
+            )
+        except Exception as exc:
+            print(f"[ERROR] demo_start notify: {exc}")
+
+    background.add_task(_notify)
+
+    return {
+        "status":      "demo_started",
+        "scenario":    req.scenario,
+        "delay_secs":  req.delay_secs,
+        "app_response": app_response,
+        "message": (
+            "Load generator active. "
+            "Watch Telegram — alert will fire when threshold is breached."
+        ),
+    }
+
+
+@api.post("/demo/stop")
+async def demo_stop(req: SimulateRequest):
+    """Stop the running load generator on the infra-app."""
+    import httpx
+    url = req.service_url or settings.CLOUD_RUN_SERVICE_URL
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.post(
+                f"{url}/demo/stop",
+                headers={"X-Admin-Token": "infraguard-secret-2026"},
+            )
+            return r.json()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Could not stop demo: {exc}")
+
+
+@api.get("/demo/status")
+async def demo_status(service_url: Optional[str] = None):
+    """
+    Live status: threshold counters + demo running state + recent incidents.
+    Poll this every few seconds while the demo is running to watch counters climb.
+    """
+    import httpx
+    url = service_url or settings.CLOUD_RUN_SERVICE_URL
+    app_status = {}
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get(f"{url}/demo/status")
+            app_status = r.json()
+    except Exception as exc:
+        app_status = {"error": str(exc)}
+
+    recent_incidents = []
+    try:
+        recent_incidents = list_incidents()[:5]
+    except Exception:
+        pass
+
+    return {
+        "app_load_generator": app_status,
+        "recent_incidents":   recent_incidents,
+    }
 
 
 # ── Reset endpoint — restore everything to baseline for retesting ─────────────

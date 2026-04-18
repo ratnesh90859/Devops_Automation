@@ -1,0 +1,12 @@
+# Override default .gitignore behavior for Cloud Build
+# We NEED terraform.tfvars in the image
+.git/
+gcp-key.json
+cloudrun-env.yaml
+.env
+infra-app/
+monitoring/
+scripts/
+terraform/.terraform/
+terraform/terraform.tfstate
+terraform/terraform.tfstate.backup

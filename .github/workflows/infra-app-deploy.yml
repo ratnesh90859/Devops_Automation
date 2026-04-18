@@ -1,0 +1,76 @@
+name: Build and Deploy order-api
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "infra-app/**"
+  workflow_dispatch:
+
+jobs:
+  build-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Build image
+        run: |
+          gcloud builds submit infra-app \
+            --tag asia-south1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/infra-agent/order-api:${{ github.sha }} \
+            --project ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run deploy order-api \
+            --image asia-south1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/infra-agent/order-api:${{ github.sha }} \
+            --region asia-south1 \
+            --memory 256Mi \
+            --cpu 1 \
+            --min-instances 0 \
+            --max-instances 5 \
+            --timeout 30 \
+            --allow-unauthenticated \
+            --project ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Notify agent (success)
+        if: success()
+        run: |
+          curl -sf -X POST "${{ secrets.AGENT_WEBHOOK_URL }}/webhook" \
+            -H "X-Token: ${{ secrets.WEBHOOK_SECRET }}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"source\":  \"github\",
+              \"status\":  \"success\",
+              \"service_url\": \"${{ secrets.CLOUD_RUN_SERVICE_URL }}\",
+              \"run_id\":  \"${{ github.run_id }}\",
+              \"branch\":  \"${{ github.ref_name }}\",
+              \"commit\":  \"${{ github.sha }}\"
+            }" || echo "[WARN] Webhook notify failed (non-fatal)"
+
+      - name: Notify agent (failure)
+        if: failure()
+        run: |
+          curl -s -X POST "${{ secrets.AGENT_WEBHOOK_URL }}/webhook" \
+            -H "X-Token: ${{ secrets.WEBHOOK_SECRET }}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"source\":  \"github\",
+              \"status\":  \"failure\",
+              \"run_id\":  \"${{ github.run_id }}\",
+              \"branch\":  \"${{ github.ref_name }}\",
+              \"commit\":  \"${{ github.sha }}\",
+              \"error\":   \"Build/deploy failed on run ${{ github.run_id }}\"
+            }" || true

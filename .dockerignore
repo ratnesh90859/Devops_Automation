@@ -1,0 +1,11 @@
+terraform/.terraform/
+terraform/terraform.tfstate
+terraform/terraform.tfstate.backup
+terraform/.terraform.lock.hcl
+gcp-key.json
+cloudrun-env.yaml
+.env
+.git/
+infra-app/
+monitoring/
+scripts/

@@ -205,12 +205,19 @@ async def reset_to_baseline() -> tuple[bool, str]:
         if current_value != baseline_value:
             write_tfvar(tfvar, baseline_value)
             changed.append(f"{tfvar}: {current_value!r} → {baseline_value!r}")
+        else:
+            # Always write baseline values so tfvars matches reality even when
+            # a previous container revision applied a fix (tfvars reset on restart)
+            write_tfvar(tfvar, baseline_value)
 
-    if not changed:
-        return True, "Already at baseline — no changes needed."
-
+    # Always run terraform apply — the actual Cloud Run service may differ from
+    # the tfvars file if a previous container revision applied a fix and was then
+    # replaced (new revision starts with the image-baked tfvars, not the modified one).
     ok, output = await _run_apply()
-    summary = "Reset changes:\n" + "\n".join(f"  • {c}" for c in changed)
+    if not changed:
+        summary = "Terraform re-applied to ensure Cloud Run matches baseline."
+    else:
+        summary = "Reset changes:\n" + "\n".join(f"  • {c}" for c in changed)
     if ok:
         return True, f"Baseline restored.\n{summary}"
     return False, f"Terraform apply failed after baseline reset.\n{summary}\n\nError:\n{output}"

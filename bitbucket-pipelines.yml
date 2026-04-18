@@ -3,57 +3,148 @@ image: google/cloud-sdk:alpine
 pipelines:
   default:
     - step:
-        name: Build and Deploy to Cloud Run
+        name: Fix-Aware Deploy
         script:
           - echo $GCP_KEY > /tmp/key.json
           - gcloud auth activate-service-account --key-file=/tmp/key.json
           - gcloud config set project $GCP_PROJECT_ID
-          - gcloud builds submit infra-app
-              --tag asia-south1-docker.pkg.dev/$GCP_PROJECT_ID/infra-agent/order-api:$BITBUCKET_COMMIT
-              --project $GCP_PROJECT_ID
-          - gcloud run deploy order-api
-              --image asia-south1-docker.pkg.dev/$GCP_PROJECT_ID/infra-agent/order-api:$BITBUCKET_COMMIT
-              --region asia-south1
-              --memory 256Mi
-              --cpu 1
-              --min-instances 0
-              --max-instances 5
-              --timeout 30
-              --allow-unauthenticated
-              --project $GCP_PROJECT_ID
-          # Notify agent that the pipeline succeeded and new image is live
+
+          # ── Determine what kind of action to take ───────────────────────
           - |
-            curl -s -X POST "$AGENT_WEBHOOK_URL/webhook" \
+            if [ -f .fix-meta.json ]; then
+              FIX_TYPE=$(python3 -c "import json,sys; d=json.load(open('.fix-meta.json')); print(d.get('fix_type','app'))")
+              INCIDENT_ID=$(python3 -c "import json,sys; d=json.load(open('.fix-meta.json')); print(d.get('incident_id',''))")
+              echo "[INFO] Fix branch detected: fix_type=$FIX_TYPE incident=$INCIDENT_ID"
+            else
+              FIX_TYPE="app"
+              INCIDENT_ID=""
+              echo "[INFO] Regular app deploy (no .fix-meta.json)"
+            fi
+
+          # ── PATH A: Terraform infra change (memory / cpu / timeout) ─────
+          - |
+            if [ "$FIX_TYPE" = "infra" ]; then
+              echo "[INFO] PATH A: Applying Terraform infra change…"
+              apk add --no-cache curl unzip
+              curl -sL https://releases.hashicorp.com/terraform/1.7.5/terraform_1.7.5_linux_amd64.zip \
+                   -o /tmp/tf.zip
+              unzip -q /tmp/tf.zip -d /usr/local/bin/
+              chmod +x /usr/local/bin/terraform
+              terraform --version
+              cd terraform
+              terraform init -input=false -reconfigure \
+                -backend-config="bucket=$TF_STATE_BUCKET" \
+                -backend-config="prefix=infra-ai-debugger"
+              terraform apply \
+                -auto-approve \
+                -input=false \
+                -target=google_cloud_run_v2_service.order_api
+              cd ..
+              echo "[INFO] Terraform apply complete."
+            fi
+
+          # ── PATH B: Rollback to previous image ──────────────────────────
+          - |
+            if [ "$FIX_TYPE" = "rollback" ]; then
+              echo "[INFO] PATH B: Rolling back to previous image…"
+              ROLLBACK_IMAGE=$(python3 -c "import json; d=json.load(open('.fix-meta.json')); print(d.get('rollback_image',''))")
+              if [ -z "$ROLLBACK_IMAGE" ]; then
+                echo "[ERROR] rollback_image is empty in .fix-meta.json" >&2
+                exit 1
+              fi
+              echo "[INFO] Target image: $ROLLBACK_IMAGE"
+              gcloud run deploy order-api \
+                --image "$ROLLBACK_IMAGE" \
+                --region asia-south1 \
+                --allow-unauthenticated \
+                --project $GCP_PROJECT_ID
+              echo "[INFO] Rollback complete."
+            fi
+
+          # ── PATH C: App code fix (build + deploy new image) ─────────────
+          - |
+            if [ "$FIX_TYPE" = "code" ]; then
+              echo "[INFO] PATH C: Building and deploying code fix…"
+              gcloud builds submit infra-app \
+                --tag asia-south1-docker.pkg.dev/$GCP_PROJECT_ID/infra-agent/order-api:$BITBUCKET_COMMIT \
+                --project $GCP_PROJECT_ID
+              gcloud run deploy order-api \
+                --image asia-south1-docker.pkg.dev/$GCP_PROJECT_ID/infra-agent/order-api:$BITBUCKET_COMMIT \
+                --region asia-south1 \
+                --memory 256Mi \
+                --cpu 1 \
+                --min-instances 0 \
+                --max-instances 5 \
+                --timeout 30 \
+                --allow-unauthenticated \
+                --project $GCP_PROJECT_ID
+              echo "[INFO] Code fix deploy complete."
+            fi
+
+          # ── PATH D: Regular app deploy (no fix) ─────────────────────────
+          - |
+            if [ "$FIX_TYPE" = "app" ]; then
+              echo "[INFO] PATH D: Regular app deploy…"
+              gcloud builds submit infra-app \
+                --tag asia-south1-docker.pkg.dev/$GCP_PROJECT_ID/infra-agent/order-api:$BITBUCKET_COMMIT \
+                --project $GCP_PROJECT_ID
+              gcloud run deploy order-api \
+                --image asia-south1-docker.pkg.dev/$GCP_PROJECT_ID/infra-agent/order-api:$BITBUCKET_COMMIT \
+                --region asia-south1 \
+                --memory 256Mi \
+                --cpu 1 \
+                --min-instances 0 \
+                --max-instances 5 \
+                --timeout 30 \
+                --allow-unauthenticated \
+                --project $GCP_PROJECT_ID
+              echo "[INFO] Regular deploy complete."
+            fi
+
+          # ── Notify agent: deployment succeeded ──────────────────────────
+          - |
+            IMAGE_TAG="asia-south1-docker.pkg.dev/$GCP_PROJECT_ID/infra-agent/order-api:$BITBUCKET_COMMIT"
+            if [ "$FIX_TYPE" = "rollback" ]; then
+              IMAGE_TAG=$(python3 -c "import json; d=json.load(open('.fix-meta.json')); print(d.get('rollback_image',''))")
+            fi
+            if [ -f .fix-meta.json ]; then
+              FIX_META_JSON=$(cat .fix-meta.json)
+            else
+              FIX_META_JSON="{\"fix_type\":\"app\"}"
+            fi
+            curl -sf -X POST "$AGENT_WEBHOOK_URL/webhook" \
               -H "X-Token: $WEBHOOK_SECRET" \
               -H "Content-Type: application/json" \
               -d "{
-                \"source\": \"bitbucket\",
-                \"status\": \"success\",
-                \"service_url\": \"$CLOUD_RUN_SERVICE_URL\",
+                \"source\":       \"bitbucket\",
+                \"status\":       \"success\",
+                \"fix_meta\":     $FIX_META_JSON,
+                \"commit\":       \"$BITBUCKET_COMMIT\",
+                \"image_tag\":    \"$IMAGE_TAG\",
                 \"build_number\": \"$BITBUCKET_BUILD_NUMBER\",
-                \"branch\": \"$BITBUCKET_BRANCH\",
-                \"commit\": \"$BITBUCKET_COMMIT\"
-              }"
+                \"branch\":       \"$BITBUCKET_BRANCH\"
+              }" || echo "[WARN] Agent webhook notification failed (non-fatal)"
+
         after-script:
+          # Notify agent on ANY failure so it can alert Telegram
           - |
             if [ $BITBUCKET_EXIT_CODE -ne 0 ]; then
               curl -s -X POST "$AGENT_WEBHOOK_URL/webhook" \
                 -H "X-Token: $WEBHOOK_SECRET" \
                 -H "Content-Type: application/json" \
                 -d "{
-                  \"source\": \"bitbucket\",
-                  \"status\": \"failure\",
-                  \"service_url\": \"$CLOUD_RUN_SERVICE_URL\",
+                  \"source\":       \"bitbucket\",
+                  \"status\":       \"failure\",
                   \"build_number\": \"$BITBUCKET_BUILD_NUMBER\",
-                  \"branch\": \"$BITBUCKET_BRANCH\",
-                  \"commit\": \"$BITBUCKET_COMMIT\",
-                  \"error\": \"Pipeline failed on build $BITBUCKET_BUILD_NUMBER\"
-                }"
+                  \"branch\":       \"$BITBUCKET_BRANCH\",
+                  \"commit\":       \"$BITBUCKET_COMMIT\",
+                  \"error\":        \"Pipeline failed on build $BITBUCKET_BUILD_NUMBER\"
+                }" || true
             fi
 
-# Bitbucket repository variables to set:
-# GCP_KEY               - service account JSON (paste full JSON)
-# GCP_PROJECT_ID        - your GCP project id
-# AGENT_WEBHOOK_URL     - your agent public URL
-# WEBHOOK_SECRET        - same secret as in agent .env
-# CLOUD_RUN_SERVICE_URL - filled after first deploy
+# ── Bitbucket repository variables required ──────────────────────────────────
+# GCP_KEY           - Service account JSON (full JSON, mark as secured)
+# GCP_PROJECT_ID    - GCP project id                  (e.g. testing-ratnesh)
+# TF_STATE_BUCKET   - Terraform state GCS bucket      (e.g. testing-ratnesh-terraform-state)
+# AGENT_WEBHOOK_URL - infra-agent Cloud Run URL       (no trailing slash)
+# WEBHOOK_SECRET    - X-Token value                   (same as agent env WEBHOOK_SECRET)

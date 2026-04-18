@@ -12,11 +12,8 @@ terraform {
     }
   }
 
-  # Uncomment after creating the GCS bucket for state:
-  # bucket name format: <project-id>-terraform-state
-  #
-  # backend "gcs" {
-  #   bucket = "YOUR_PROJECT_ID-terraform-state"
-  #   prefix = "infra-ai-debugger"
-  # }
+  backend "gcs" {
+    bucket = "testing-ratnesh-terraform-state"
+    prefix = "infra-ai-debugger"
+  }
 }

@@ -1,0 +1,168 @@
+name: Fix-Aware Deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [closed]
+    branches: [main]
+  workflow_dispatch:   # allow infra-agent to trigger via API
+
+jobs:
+  deploy:
+    # Only run on merge (not just any PR event) or on push/dispatch
+    if: >
+      github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && github.event.pull_request.merged == true)
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Auth ─────────────────────────────────────────────────────────────
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+      # ── Determine fix type ───────────────────────────────────────────────
+      - name: Read fix-meta
+        id: meta
+        run: |
+          if [ -f .fix-meta.json ]; then
+            FIX_TYPE=$(python3 -c "import json; print(json.load(open('.fix-meta.json')).get('fix_type','app'))")
+            INCIDENT_ID=$(python3 -c "import json; print(json.load(open('.fix-meta.json')).get('incident_id',''))")
+          else
+            FIX_TYPE="app"
+            INCIDENT_ID=""
+          fi
+          echo "fix_type=$FIX_TYPE"     >> "$GITHUB_OUTPUT"
+          echo "incident_id=$INCIDENT_ID" >> "$GITHUB_OUTPUT"
+          echo "[INFO] fix_type=$FIX_TYPE  incident=$INCIDENT_ID"
+
+      # ── PATH A: Terraform infra change (memory / cpu / timeout) ─────────
+      - name: Terraform apply (infra fix)
+        if: steps.meta.outputs.fix_type == 'infra'
+        run: |
+          echo "[INFO] PATH A: Applying Terraform infra change…"
+          curl -sL https://releases.hashicorp.com/terraform/1.7.5/terraform_1.7.5_linux_amd64.zip \
+               -o /tmp/tf.zip
+          unzip -q /tmp/tf.zip -d /usr/local/bin/
+          chmod +x /usr/local/bin/terraform
+          terraform --version
+          cd terraform
+          terraform init -input=false -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="prefix=infra-ai-debugger"
+          terraform apply \
+            -auto-approve \
+            -input=false \
+            -target=google_cloud_run_v2_service.order_api
+          echo "[INFO] Terraform apply complete."
+
+      # ── PATH B: Rollback to previous image ──────────────────────────────
+      - name: Rollback image
+        if: steps.meta.outputs.fix_type == 'rollback'
+        run: |
+          echo "[INFO] PATH B: Rolling back to previous image…"
+          ROLLBACK_IMAGE=$(python3 -c "import json; print(json.load(open('.fix-meta.json')).get('rollback_image',''))")
+          if [ -z "$ROLLBACK_IMAGE" ]; then
+            echo "[ERROR] rollback_image is empty in .fix-meta.json" >&2
+            exit 1
+          fi
+          echo "[INFO] Target image: $ROLLBACK_IMAGE"
+          gcloud run deploy order-api \
+            --image "$ROLLBACK_IMAGE" \
+            --region asia-south1 \
+            --allow-unauthenticated \
+            --project ${{ secrets.GCP_PROJECT_ID }}
+          echo "[INFO] Rollback complete."
+
+      # ── PATH C: AI code fix ──────────────────────────────────────────────
+      - name: Build and deploy code fix
+        if: steps.meta.outputs.fix_type == 'code'
+        run: |
+          echo "[INFO] PATH C: Building and deploying code fix…"
+          gcloud builds submit infra-app \
+            --tag asia-south1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/infra-agent/order-api:${{ github.sha }} \
+            --project ${{ secrets.GCP_PROJECT_ID }}
+          gcloud run deploy order-api \
+            --image asia-south1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/infra-agent/order-api:${{ github.sha }} \
+            --region asia-south1 \
+            --memory 256Mi \
+            --cpu 1 \
+            --min-instances 0 \
+            --max-instances 5 \
+            --timeout 30 \
+            --allow-unauthenticated \
+            --project ${{ secrets.GCP_PROJECT_ID }}
+          echo "[INFO] Code fix deploy complete."
+
+      # ── PATH D: Regular app deploy ───────────────────────────────────────
+      - name: Build and deploy app
+        if: steps.meta.outputs.fix_type == 'app'
+        run: |
+          echo "[INFO] PATH D: Regular app deploy…"
+          gcloud builds submit infra-app \
+            --tag asia-south1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/infra-agent/order-api:${{ github.sha }} \
+            --project ${{ secrets.GCP_PROJECT_ID }}
+          gcloud run deploy order-api \
+            --image asia-south1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/infra-agent/order-api:${{ github.sha }} \
+            --region asia-south1 \
+            --memory 256Mi \
+            --cpu 1 \
+            --min-instances 0 \
+            --max-instances 5 \
+            --timeout 30 \
+            --allow-unauthenticated \
+            --project ${{ secrets.GCP_PROJECT_ID }}
+          echo "[INFO] Regular deploy complete."
+
+      # ── Notify agent: success ────────────────────────────────────────────
+      - name: Notify agent (success)
+        if: success()
+        run: |
+          FIX_TYPE="${{ steps.meta.outputs.fix_type }}"
+          IMAGE_TAG="asia-south1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/infra-agent/order-api:${{ github.sha }}"
+          if [ -f .fix-meta.json ]; then
+            FIX_META_JSON=$(cat .fix-meta.json)
+          else
+            FIX_META_JSON="{\"fix_type\":\"app\"}"
+          fi
+          curl -sf -X POST "${{ secrets.AGENT_WEBHOOK_URL }}/webhook" \
+            -H "X-Token: ${{ secrets.WEBHOOK_SECRET }}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"source\":       \"github\",
+              \"status\":       \"success\",
+              \"fix_meta\":     $FIX_META_JSON,
+              \"commit\":       \"${{ github.sha }}\",
+              \"image_tag\":    \"$IMAGE_TAG\",
+              \"run_id\":       \"${{ github.run_id }}\",
+              \"branch\":       \"${{ github.ref_name }}\"
+            }" || echo "[WARN] Agent webhook notification failed (non-fatal)"
+
+      # ── Notify agent: failure ────────────────────────────────────────────
+      - name: Notify agent (failure)
+        if: failure()
+        run: |
+          curl -s -X POST "${{ secrets.AGENT_WEBHOOK_URL }}/webhook" \
+            -H "X-Token: ${{ secrets.WEBHOOK_SECRET }}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"source\":  \"github\",
+              \"status\":  \"failure\",
+              \"run_id\":  \"${{ github.run_id }}\",
+              \"branch\":  \"${{ github.ref_name }}\",
+              \"commit\":  \"${{ github.sha }}\",
+              \"error\":   \"Workflow failed on run ${{ github.run_id }}\"
+            }" || true
