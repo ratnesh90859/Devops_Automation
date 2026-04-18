@@ -7,8 +7,17 @@ from flow import handle_alert
 from db import list_incidents
 from config import settings
 import terraform_runner
+import asyncio, time
 
 api = FastAPI(title="Infra AI Debugger", version="1.0.0")
+
+# ── Alert deduplication ───────────────────────────────────────────────────────
+# Prevent duplicate Telegram alerts for the same issue. Only one incident
+# at a time can be "active" (awaiting_approval / creating_pr / pr_created).
+# New webhooks that arrive while an incident is active are silently dropped.
+_active_incident_lock = asyncio.Lock()
+_active_incident: dict | None = None  # {"id": ..., "issue_type": ..., "created_at": float}
+_ACTIVE_TTL = 600  # seconds — auto-expire if incident sits unresolved for 10 min
 
 
 @api.on_event("startup")
@@ -33,9 +42,9 @@ async def webhook(request: Request, background: BackgroundTasks):
             raise HTTPException(status_code=401, detail="Unauthorized")
 
     # ------------------------------------------------------------------
-    # Bitbucket pipeline success notification
+    # Pipeline / GitHub Actions success notification
     # ------------------------------------------------------------------
-    if source == "bitbucket" and body.get("status") == "success":
+    if source in ("bitbucket", "github") and body.get("status") == "success":
         # Track this deployment for regression detection.
         # The pipeline sends fix_meta (type/incident_id) + commit + image_tag.
         try:
@@ -84,13 +93,33 @@ async def webhook(request: Request, background: BackgroundTasks):
         }
 
     # ------------------------------------------------------------------
-    # Grafana alert OR Bitbucket failure → trigger AI diagnosis
+    # Alert dedup + AI diagnosis
     # ------------------------------------------------------------------
     service_url = body.get("service_url", settings.CLOUD_RUN_SERVICE_URL)
 
     async def run():
+        global _active_incident
+        # Check if there's already an active incident — skip if so
+        async with _active_incident_lock:
+            if _active_incident:
+                age = time.time() - _active_incident.get("created_at", 0)
+                if age < _ACTIVE_TTL:
+                    print(f"[INFO] Suppressed duplicate alert — active incident "
+                          f"{_active_incident['id'][:8]} ({_active_incident['issue_type']}) "
+                          f"is {age:.0f}s old")
+                    return
+                # Expired — clear it
+                _active_incident = None
+
         try:
             incident = await handle_alert(source, service_url, alert_body=body)
+            # Mark as active so subsequent webhooks are suppressed
+            async with _active_incident_lock:
+                _active_incident = {
+                    "id": incident["id"],
+                    "issue_type": incident.get("issue_type", "unknown"),
+                    "created_at": time.time(),
+                }
             await send_alert(incident)
             await send_deep_report(incident)
         except Exception as exc:

@@ -5,13 +5,13 @@ from datetime import datetime, timezone
 from logger import fetch_logs, fetch_all_loki_logs, get_current_revision
 from cloudrun import get_config, is_healthy
 import terraform_runner
-import github_client as bitbucket  # GitHub replaces Bitbucket — same API surface
+import github_client as github
 from ai import diagnose, analyze_deep, suggest_code_fix
 from db import create_incident, get_incident, update_incident, get_latest_deployment, get_previous_deployment
 
-# Path inside the Bitbucket repo that contains the app source
+# Path inside the GitHub repo that contains the app source
 _APP_FILE = "infra-app/app.py"
-# Path inside the Bitbucket repo for Terraform variables
+# Path inside the GitHub repo for Terraform variables
 _TFVARS_FILE = "terraform/terraform.tfvars"
 
 
@@ -192,16 +192,16 @@ async def _infra_fix(incident: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Code fix path (push to Bitbucket → pipeline → Cloud Run)
+# Code fix path (push to GitHub → pipeline → Cloud Run)
 # ---------------------------------------------------------------------------
 
 async def _code_fix(incident: dict) -> dict:
     """
     Flow:
-      1. Fetch current app.py from Bitbucket
+      1. Fetch current app.py from GitHub
       2. Ask AI to generate a patched version
-      3. Commit the patch to Bitbucket
-      4. Wait for the Bitbucket pipeline to finish (build + push image)
+      3. Commit the patch to GitHub
+      4. Wait for the GitHub pipeline to finish (build + push image)
       5. Wait for Cloud Run to pick up the new revision
       6. Health-check; rollback (revert file + re-pipeline) if unhealthy
     """
@@ -209,11 +209,11 @@ async def _code_fix(incident: dict) -> dict:
 
     # 1. Get current file
     try:
-        current_content = await bitbucket.get_file(_APP_FILE)
+        current_content = await github.get_file(_APP_FILE)
     except Exception as exc:
         update_incident(incident["id"], {
-            "status": "bitbucket_error",
-            "bitbucket_error": f"Could not fetch file: {exc}",
+            "status": "GitHub_error",
+            "GitHub_error": f"Could not fetch file: {exc}",
         })
         return {"healthy": False, "error": str(exc)}
 
@@ -238,15 +238,15 @@ async def _code_fix(incident: dict) -> dict:
     })
 
     # 3. Commit the patch
-    committed = await bitbucket.commit_file(_APP_FILE, fixed_content, commit_msg)
+    committed = await github.commit_file(_APP_FILE, fixed_content, commit_msg)
     if not committed:
-        update_incident(incident["id"], {"status": "bitbucket_commit_failed"})
-        return {"healthy": False, "error": "Bitbucket commit failed"}
+        update_incident(incident["id"], {"status": "GitHub_commit_failed"})
+        return {"healthy": False, "error": "GitHub commit failed"}
 
     # 4. The commit triggers the pipeline automatically; wait for it
     update_incident(incident["id"], {"status": "waiting_pipeline"})
-    pipeline_uuid = await bitbucket.trigger_pipeline()
-    pipeline_ok = await bitbucket.wait_for_pipeline(pipeline_uuid, timeout=600)
+    pipeline_uuid = await github.trigger_pipeline()
+    pipeline_ok = await github.wait_for_pipeline(pipeline_uuid, timeout=600)
 
     if not pipeline_ok:
         update_incident(incident["id"], {
@@ -254,11 +254,11 @@ async def _code_fix(incident: dict) -> dict:
             "pipeline_uuid": pipeline_uuid,
         })
         # Attempt rollback: restore previous content and re-trigger
-        await bitbucket.commit_file(
+        await github.commit_file(
             _APP_FILE, current_content, "revert: pipeline failed, restoring previous code"
         )
-        rollback_uuid = await bitbucket.trigger_pipeline()
-        await bitbucket.wait_for_pipeline(rollback_uuid, timeout=600)
+        rollback_uuid = await github.trigger_pipeline()
+        await github.wait_for_pipeline(rollback_uuid, timeout=600)
         update_incident(incident["id"], {"status": "rolled_back"})
         return {"healthy": False, "pipeline_failed": True}
 
@@ -287,11 +287,11 @@ async def _code_fix(incident: dict) -> dict:
         }
     else:
         # Rollback: restore previous file content and redeploy
-        await bitbucket.commit_file(
+        await github.commit_file(
             _APP_FILE, current_content, "revert: unhealthy after code fix, restoring previous code"
         )
-        rollback_uuid = await bitbucket.trigger_pipeline()
-        await bitbucket.wait_for_pipeline(rollback_uuid, timeout=600)
+        rollback_uuid = await github.trigger_pipeline()
+        await github.wait_for_pipeline(rollback_uuid, timeout=600)
         update_incident(incident["id"], {"status": "rolled_back"})
         return {"healthy": False, "rolled_back": True}
 
@@ -391,9 +391,9 @@ async def create_fix_pr(incident: dict) -> dict:
     update_incident(incident_id, {"status": "creating_pr_branch"})
 
     # ── 1. Create branch ─────────────────────────────────────────────────────
-    created = await bitbucket.create_branch(branch_name)
+    created = await github.create_branch(branch_name)
     if not created:
-        raise RuntimeError(f"Failed to create branch '{branch_name}' — check Bitbucket credentials")
+        raise RuntimeError(f"Failed to create branch '{branch_name}' — check GitHub credentials")
 
     update_incident(incident_id, {"fix_branch": branch_name})
 
@@ -401,9 +401,9 @@ async def create_fix_pr(incident: dict) -> dict:
 
     # ── 2. Build the files to commit based on fix type ───────────────────────
     if fix_type == "infra":
-        # Fetch current tfvars from Bitbucket and patch the fix field
+        # Fetch current tfvars from GitHub and patch the fix field
         try:
-            tfvars_content = await bitbucket.get_file(_TFVARS_FILE)
+            tfvars_content = await github.get_file(_TFVARS_FILE)
         except Exception as exc:
             raise RuntimeError(f"Could not fetch {_TFVARS_FILE}: {exc}")
 
@@ -448,7 +448,7 @@ async def create_fix_pr(incident: dict) -> dict:
 
     else:  # code fix
         try:
-            current_content = await bitbucket.get_file(_APP_FILE)
+            current_content = await github.get_file(_APP_FILE)
         except Exception as exc:
             raise RuntimeError(f"Could not fetch {_APP_FILE}: {exc}")
 
@@ -478,16 +478,16 @@ async def create_fix_pr(incident: dict) -> dict:
         }, indent=2)
 
     # ── 3. Commit files to the fix branch ────────────────────────────────────
-    committed = await bitbucket.commit_to_branch(branch_name, files, commit_msg)
+    committed = await github.commit_to_branch(branch_name, files, commit_msg)
     if not committed:
         raise RuntimeError(f"Failed to commit files to branch '{branch_name}'")
 
     # ── 4. Create the Pull Request ───────────────────────────────────────────
     pr_title       = f"fix({issue_type}): {incident.get('fix_field', fix_type)} change"
     pr_description = _build_pr_description(incident)
-    pr             = await bitbucket.create_pr(pr_title, pr_description, branch_name)
+    pr             = await github.create_pr(pr_title, pr_description, branch_name)
     if not pr:
-        raise RuntimeError("Bitbucket PR creation failed — check API token permissions")
+        raise RuntimeError("GitHub PR creation failed — check API token permissions")
 
     update_incident(incident_id, {
         "status":     "pr_created",
@@ -509,3 +509,23 @@ async def reject(incident_id: str, reason: str = ""):
     if reason:
         fields["rejection_reason"] = reason
     update_incident(incident_id, fields)
+    # Clear the dedup lock so new alerts can come through
+    _clear_active_incident()
+
+
+def _clear_active_incident():
+    """Clear the dedup lock in main.py so new alerts are accepted."""
+    try:
+        import main as _main
+        import asyncio
+        async def _clear():
+            async with _main._active_incident_lock:
+                _main._active_incident = None
+        # If we're already in an event loop, schedule it
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(_clear())
+        except RuntimeError:
+            asyncio.run(_clear())
+    except Exception:
+        pass  # best-effort

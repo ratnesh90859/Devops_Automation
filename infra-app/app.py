@@ -37,11 +37,14 @@ _ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "infraguard-secret-2026")
 # diagnose the issue, suggest a fix, and prompt for approval on Telegram.
 
 _threshold_lock   = threading.Lock()
-_COOLDOWN_UNTIL   = 0.0   # Unix timestamp — suppress duplicate alerts before this
+_COOLDOWN_UNTIL   = 0.0   # Unix timestamp — suppress duplicate count-based alerts
+_MEM_COOLDOWN_UNTIL = 0.0 # Separate cooldown for memory threshold alerts
 _COOLDOWN_SECS    = int(os.getenv("THRESHOLD_COOLDOWN_SECS", "120"))
+_MEM_COOLDOWN_SECS = int(os.getenv("MEMORY_COOLDOWN_SECS", "300"))  # 5 min between memory alerts
 _AGENT_WEBHOOK    = os.getenv("AGENT_WEBHOOK_URL", "")
 _WEBHOOK_SECRET   = os.getenv("WEBHOOK_SECRET", "")
 _app_start_time   = time.time()   # used to compute uptime in alert payloads
+_MEMORY_ALERT_FIRED = False  # Only fire ONE memory alert per container lifecycle
 
 # Memory threshold — fires when RSS exceeds 80% of the container limit.
 # Cloud Run 256Mi container limit ≈ 256 MB process RSS before OOM kill.
@@ -174,20 +177,20 @@ def _increment_threshold(key: str) -> None:
 
 def _check_memory_threshold() -> None:
     """
-    Fire an alert when process RSS exceeds 80% of the container memory limit.
-    Unlike count-based thresholds, this resets after each cooldown period so
-    it fires again if memory stays high — giving a continuous alert trail as
-    memory climbs and the container limit is progressively increased.
+    Fire ONE alert when process RSS exceeds 80% of the container memory limit.
+    Only fires once per container lifecycle to avoid flooding the agent with
+    duplicate alerts. The agent handles the fix via PR → merge → terraform.
     """
-    global _COOLDOWN_UNTIL
+    global _MEMORY_ALERT_FIRED
+    if _MEMORY_ALERT_FIRED:
+        return
     mem_mb = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
     if mem_mb < _MEMORY_THRESHOLD_MB:
         return
-    now = time.time()
     with _threshold_lock:
-        if now < _COOLDOWN_UNTIL:
-            return
-        _COOLDOWN_UNTIL = now + _COOLDOWN_SECS
+        if _MEMORY_ALERT_FIRED:
+            return  # double-check under lock
+        _MEMORY_ALERT_FIRED = True
 
     pct = round(mem_mb / _MEMORY_LIMIT_MB * 100, 1)
     log_infra("memory_threshold_breached",
@@ -457,7 +460,7 @@ def reset():
     - Resets LOAD_SIZE and SLEEP_SECONDS env overrides to defaults
     Call this before retesting any scenario.
     """
-    global _leak_store, _heavy_enabled, _COOLDOWN_UNTIL
+    global _leak_store, _heavy_enabled, _COOLDOWN_UNTIL, _MEMORY_ALERT_FIRED
     cleared_items = len(_leak_store)
     _leak_store = []
     _heavy_enabled = True
@@ -468,6 +471,7 @@ def reset():
             v["count"] = 0
             v["fired"] = False
     _COOLDOWN_UNTIL = 0.0
+    _MEMORY_ALERT_FIRED = False
     log_infra("thresholds_reset_via_reset_endpoint")
 
     import gc

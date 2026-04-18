@@ -92,7 +92,7 @@ def _validate_diagnosis(d: dict, config: dict, logs: str = "") -> dict:
         "timeout":              ("timeout",       timeout,  str(min(int(timeout) * 2, 3600))),
         "cold_start":           ("min_instances", min_inst, "1"),
         "crash":                ("memory",        mem,      _double_memory(mem)),
-        "code_error":           ("code",          "current","patched via Bitbucket PR"),
+        "code_error":           ("code",          "current","patched via GitHub PR"),
         "deployment_regression":("rollback",      "current","previous image"),
         "unknown":              ("min_instances", min_inst, "1"),
     }
@@ -214,7 +214,7 @@ STEP 3 — ONLY IF NO CODE BUG AND NO MEMORY ISSUE, CHECK OTHER INFRA:
 
 ═══ FIX MAPPING ═══
 - deployment_regression → fix_type="rollback", fix_field="rollback", fix_new_value="previous image"
-- code_error  → fix_type="code", fix_field="code", fix_old_value="current", fix_new_value="patched via Bitbucket PR"
+- code_error  → fix_type="code", fix_field="code", fix_old_value="current", fix_new_value="patched via GitHub PR"
 - oom         → fix_type="infra", fix_field="memory", double the current value
 - crash (no code bug in logs) → fix_type="infra", fix_field="memory", double the current value
 - timeout     → fix_type="infra", fix_field="timeout", double the value

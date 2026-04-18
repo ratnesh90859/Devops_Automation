@@ -69,7 +69,7 @@ async def _safe_send(chat_id=None, **kwargs):
 async def send_alert(incident: dict) -> int:
     icon = ICONS.get(incident["issue_type"], "⚠️")
     fix_type = incident.get("fix_type", "infra")
-    fix_label = "Bitbucket code push" if fix_type == "code" else "Terraform infra change"
+    fix_label = "GitHub Actions CI/CD" if fix_type == "code" else "Terraform infra change"
 
     root_cause = _esc(str(incident.get('root_cause') or 'N/A'))
     fix_reason = _esc(str(incident.get('fix_reason') or 'N/A'))
@@ -110,7 +110,7 @@ async def send_alert(incident: dict) -> int:
     if is_code_issue:
         fix_display = (
             f"*Proposed Fix ({fix_label}):*\n"
-            f"🔧 Auto-patch application code via Bitbucket CI/CD\n"
+            f"🔧 Auto-patch application code via GitHub Actions CI/CD\n"
             f"_{fix_reason}_"
         )
     else:
@@ -147,8 +147,8 @@ async def _do_create_pr(chat_id: int, incident_id: str, approver: str, reason: s
     """
     PR-based approval path (enterprise flow):
       1. User clicked ✅ in Telegram and typed a reason
-      2. We create a fix branch + commit changes + open a Bitbucket PR
-      3. We send the PR link to Telegram — the user reviews it in Bitbucket
+      2. We create a fix branch + commit changes + open a GitHub PR
+      3. We send the PR link to Telegram — the user reviews it on GitHub
       4. When the PR is merged, the pipeline runs and applies the fix
       5. Pipeline success webhook triggers a post-mortem report
 
@@ -164,7 +164,7 @@ async def _do_create_pr(chat_id: int, incident_id: str, approver: str, reason: s
             f"⏳ *Creating Fix PR…*\n\n"
             f"*Approved by:* {_esc(approver)}\n"
             f"*Reason:* {_esc(reason)}\n\n"
-            f"Building branch and PR in Bitbucket — should take ~10 seconds."
+            f"Building branch and PR on GitHub — should take ~10 seconds."
         ),
         parse_mode="Markdown",
     )
@@ -180,7 +180,7 @@ async def _do_create_pr(chat_id: int, incident_id: str, approver: str, reason: s
             text=(
                 f"❌ *PR creation failed*\n\n"
                 f"{err_msg}\n\n"
-                f"_Check Bitbucket API token permissions (Repositories read/write, Pull Requests write)._"
+                f"_Check GitHub token permissions (repo + workflow scopes)._"
             ),
             parse_mode="Markdown",
         )
@@ -198,14 +198,14 @@ async def _do_create_pr(chat_id: int, incident_id: str, approver: str, reason: s
     await _safe_send(
         chat_id=chat_id,
         text=(
-            f"✅ *Fix PR Created — Waiting for your Bitbucket Approval*\n\n"
+            f"✅ *Fix PR Created — Waiting for your GitHub Approval*\n\n"
             f"*Approved by:* {_esc(approver)}\n"
             f"*Reason:* {_esc(reason)}\n\n"
             f"*Fix type:* {_esc(fix_label)}\n"
             f"*Branch:* `{_esc(branch)}`\n"
             f"*PR #{pr_id}:* {pr_url}\n\n"
             f"*Next steps:*\n"
-            f"  1. Open the PR link above in Bitbucket\n"
+            f"  1. Open the PR link above on GitHub\n"
             f"  2. Review the changes (Terraform tfvars diff OR code diff)\n"
             f"  3. Approve and merge the PR\n"
             f"  4. Pipeline runs automatically: terraform apply / build+deploy\n"
