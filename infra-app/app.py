@@ -43,6 +43,12 @@ _AGENT_WEBHOOK    = os.getenv("AGENT_WEBHOOK_URL", "")
 _WEBHOOK_SECRET   = os.getenv("WEBHOOK_SECRET", "")
 _app_start_time   = time.time()   # used to compute uptime in alert payloads
 
+# Memory threshold — fires when RSS exceeds 80% of the container limit.
+# Cloud Run 256Mi container limit ≈ 256 MB process RSS before OOM kill.
+# 80% of 256 MB = ~205 MB. Override via MEMORY_THRESHOLD_MB env var.
+_MEMORY_THRESHOLD_MB = int(os.getenv("MEMORY_THRESHOLD_MB", "205"))
+_MEMORY_LIMIT_MB     = int(os.getenv("MEMORY_LIMIT_MB", "256"))  # current container limit
+
 _THRESHOLDS: dict = {
     "total_requests": {
         "count": 0,
@@ -165,6 +171,76 @@ def _increment_threshold(key: str) -> None:
     log_infra("threshold_breached", key=key, count=current, limit=limit)
     _post_alert_background(payload)
 
+
+def _check_memory_threshold() -> None:
+    """
+    Fire an alert when process RSS exceeds 80% of the container memory limit.
+    Unlike count-based thresholds, this resets after each cooldown period so
+    it fires again if memory stays high — giving a continuous alert trail as
+    memory climbs and the container limit is progressively increased.
+    """
+    global _COOLDOWN_UNTIL
+    mem_mb = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
+    if mem_mb < _MEMORY_THRESHOLD_MB:
+        return
+    now = time.time()
+    with _threshold_lock:
+        if now < _COOLDOWN_UNTIL:
+            return
+        _COOLDOWN_UNTIL = now + _COOLDOWN_SECS
+
+    pct = round(mem_mb / _MEMORY_LIMIT_MB * 100, 1)
+    log_infra("memory_threshold_breached",
+              mem_mb=round(mem_mb, 1),
+              threshold_mb=_MEMORY_THRESHOLD_MB,
+              limit_mb=_MEMORY_LIMIT_MB,
+              pct=pct)
+    payload = {
+        "source":          "threshold_monitor",
+        "alertname":       "memory_high",
+        "severity":        "high",
+        "service":         "order-api",
+        "metric":          "memory_mb",
+        "value":           str(round(mem_mb, 1)),
+        "threshold":       str(_MEMORY_THRESHOLD_MB),
+        "summary":         f"Memory {round(mem_mb,1)}MB = {pct}% of {_MEMORY_LIMIT_MB}MB container limit",
+        "description":     (
+            f"Process RSS has reached {pct}% of the container memory limit "
+            f"({round(mem_mb,1)}MB / {_MEMORY_LIMIT_MB}MB). "
+            f"Container will be OOM-killed if memory is not increased. "
+            f"Automatic AI diagnosis and fix suggestion have been triggered."
+        ),
+        "infra_logs":      (
+            f"[INFRA] memory_current_mb={round(mem_mb,1)} "
+            f"memory_threshold_mb={_MEMORY_THRESHOLD_MB} "
+            f"memory_limit_mb={_MEMORY_LIMIT_MB} "
+            f"memory_pct={pct} "
+            f"uptime_secs={round(time.time()-_app_start_time,0)}"
+        ),
+        "app_logs":        (
+            f"[APP] memory_usage_pct={pct}% "
+            f"total_requests={_THRESHOLDS['total_requests']['count']} "
+            f"total_errors={_THRESHOLDS['total_errors']['count']}"
+        ),
+        "business_logs":   (
+            f"[BIZ] service_at_risk=true "
+            f"oom_kill_imminent=true "
+            f"mem_mb={round(mem_mb,1)} "
+            f"limit_mb={_MEMORY_LIMIT_MB}"
+        ),
+        "memory_mb":       round(mem_mb, 1),
+        "memory_pct":      pct,
+        "memory_limit_mb": _MEMORY_LIMIT_MB,
+        "total_requests":  _THRESHOLDS["total_requests"]["count"],
+        "total_errors":    _THRESHOLDS["total_errors"]["count"],
+        "error_rate_pct":  round(
+            _THRESHOLDS["total_errors"]["count"] /
+            max(_THRESHOLDS["total_requests"]["count"], 1) * 100, 1
+        ),
+    }
+    _post_alert_background(payload)
+
+
 app = Flask(__name__)
 
 REQUEST_COUNT = Counter(
@@ -216,6 +292,8 @@ def record_metrics(response):
     # Count every request (skip internal /metrics and /health probes)
     if ep not in ("/metrics", "/health"):
         _increment_threshold("total_requests")
+    # Check memory on every request — fires when RSS > 80% of container limit
+    _check_memory_threshold()
     return response
 
 @app.errorhandler(Exception)

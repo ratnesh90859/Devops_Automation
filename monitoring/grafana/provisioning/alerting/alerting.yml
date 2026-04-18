@@ -180,7 +180,7 @@ groups:
                 - type: query
                   evaluator:
                     type: gt
-                    params: [200]
+                    params: [204]
                   operator:
                     type: and
                   query:
@@ -190,9 +190,9 @@ groups:
                     params: []
         noDataState: NoData
         execErrState: Alerting
-        for: 1m
+        for: 10s
         annotations:
-          summary: "Memory above 200MB on order-api"
+          summary: "Memory above 204MB (80% of 256Mi limit) on order-api"
           description: "High memory detected — automated AI fix incoming"
         labels:
           service: order-api
