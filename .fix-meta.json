@@ -1,0 +1,8 @@
+{
+  "fix_type": "infra",
+  "fix_field": "memory",
+  "fix_old_value": "256Mi",
+  "fix_new_value": "512Mi",
+  "incident_id": "1a6bde19-832e-49bb-bbd5-f8db02f67240",
+  "issue_type": "oom"
+}
