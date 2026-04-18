@@ -122,7 +122,7 @@ async def handle_alert(source: str, service_url: str, alert_body: dict = None) -
 
     # Run fast diagnosis + deep SRE analysis in parallel
     diagnosis, deep_report = await asyncio.gather(
-        diagnose(enriched_logs, config),
+        diagnose(enriched_logs, config, alert_body=alert_body),
         analyze_deep(enriched_logs, config),
     )
 

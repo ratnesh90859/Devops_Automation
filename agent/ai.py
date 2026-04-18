@@ -19,7 +19,7 @@ def _strip_fences(text: str) -> str:
     return text.strip()
 
 
-def _validate_diagnosis(d: dict, config: dict, logs: str = "") -> dict:
+def _validate_diagnosis(d: dict, config: dict, logs: str = "", alert_body: dict = None) -> dict:
     """
     Ensure every required field has a real non-null non-empty value.
     Fill in sensible defaults when the model omits or nullifies a field.
@@ -62,6 +62,30 @@ def _validate_diagnosis(d: dict, config: dict, logs: str = "") -> dict:
     has_code_bug   = any(sig in logs_lower for sig in _code_signals)
     has_memory     = any(sig in logs_lower for sig in _memory_signals)
     has_regression = any(sig in logs_lower for sig in _regression_signals)
+
+    # ── Alert-source override: threshold_monitor memory_high is ALWAYS oom ──
+    # Regression detection must never fire when the trigger is a gradual memory
+    # leak monitored by the threshold monitor — those commit SHAs in context
+    # look like "deployment info" to the AI but they are NOT a regression.
+    alert_name = (alert_body or {}).get("alertname", "") if alert_body else ""
+    alert_source = (alert_body or {}).get("source", "") if alert_body else ""
+    is_memory_threshold_alert = (
+        alert_source == "threshold_monitor" and alert_name == "memory_high"
+    )
+    if is_memory_threshold_alert:
+        has_regression = False  # never misclassify a memory leak as regression
+        if not has_code_bug:
+            has_memory = True   # ensure memory path is taken
+
+    # ── Alert-source override ──────────────────────────────────────────────────
+    # threshold_monitor memory_high alerts are ALWAYS oom — never regression.
+    _alert_name   = (alert_body or {}).get("alertname", "")
+    _alert_source = (alert_body or {}).get("source", "")
+    _is_mem_alert = (_alert_source == "threshold_monitor" and _alert_name == "memory_high")
+    if _is_mem_alert:
+        has_regression = False
+        if not has_code_bug:
+            has_memory = True
 
     # Regression takes highest priority (over memory, over code)
     if has_regression and issue not in ("deployment_regression",) and not has_code_bug:
@@ -117,7 +141,7 @@ def _double_memory(current: str) -> str:
     return table.get(current, "512Mi")
 
 
-async def diagnose(logs: str, config: dict) -> dict:
+async def diagnose(logs: str, config: dict, alert_body: dict = None) -> dict:
     # Limit context length so Gemini doesn't get overwhelmed
     logs_trimmed = logs[:4000]
 
@@ -166,6 +190,20 @@ async def diagnose(logs: str, config: dict) -> dict:
             f"This STRONGLY suggests issue_type='deployment_regression' with fix_type='rollback'.\n"
             f"The issue started after a recent deployment — rollback is the correct fix.\n"
         )
+
+    # If alert explicitly came from threshold_monitor memory_high, override hints
+    _alert_name_d   = (alert_body or {}).get("alertname", "")
+    _alert_source_d = (alert_body or {}).get("source", "")
+    if _alert_source_d == "threshold_monitor" and _alert_name_d == "memory_high":
+        regression_hint = ""  # never suggest regression for a threshold-fired memory alert
+        if not detected_signals:
+            memory_hint = (
+                f"\n\n🔴 ALERT SOURCE: threshold_monitor / memory_high\n"
+                f"Memory RSS has GRADUALLY exceeded the container limit due to a memory leak.\n"
+                f"This is NOT a deployment regression — it is a slow leak that builds over time.\n"
+                f"The ONLY correct fix is: issue_type='oom', fix_type='infra', fix_field='memory', double the memory.\n"
+                f"Do NOT suggest rollback. Do NOT suggest timeout. Increase memory only.\n"
+            )
 
     prompt = f"""You are a GCP Cloud Run SRE diagnosing a production incident.
 
@@ -245,11 +283,11 @@ Return ONLY this JSON (no markdown fences, no extra text):
         raw = _strip_fences(response.text)
         print(f"[DEBUG] diagnose() raw response: {raw[:500]}")
         parsed = json.loads(raw)
-        return _validate_diagnosis(parsed, config, logs=logs_trimmed)
+        return _validate_diagnosis(parsed, config, logs=logs_trimmed, alert_body=alert_body)
     except Exception as exc:
         print(f"[ERROR] diagnose() failed: {exc}")
         # Hard fallback — build from config without AI
-        return _validate_diagnosis({}, config, logs=logs_trimmed)
+        return _validate_diagnosis({}, config, logs=logs_trimmed, alert_body=alert_body)
 
 
 async def analyze_deep(logs: str, config: dict, issue_type: str = "unknown") -> dict:
