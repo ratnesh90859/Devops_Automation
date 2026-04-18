@@ -27,6 +27,12 @@ variable "cloudrun_memory" {
   default     = "256Mi"
 }
 
+variable "container_image" {
+  description = "Container image to deploy. PATH A (infra fix) resolves this dynamically from the running service."
+  type        = string
+  default     = "asia-south1-docker.pkg.dev/testing-ratnesh/infra-agent/order-api:enterprise-v2"
+}
+
 variable "cloudrun_cpu" {
   description = "CPU limit for the Cloud Run service (e.g. 1, 2)."
   type        = string

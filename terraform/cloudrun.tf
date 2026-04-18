@@ -8,9 +8,9 @@
 # ──────────────────────────────────────────────────────────────
 
 locals {
-  # Public hello-world placeholder used on first terraform apply.
-  # Bitbucket Pipelines will replace this with the real image after first build.
-  initial_image = "us-docker.pkg.dev/cloudrun/container/hello:latest"
+  # Use the var.container_image which PATH A dynamically resolves from the
+  # currently running Cloud Run revision before terraform apply.
+  initial_image = var.container_image
 }
 
 resource "google_cloud_run_v2_service" "order_api" {
@@ -124,10 +124,10 @@ resource "google_cloud_run_v2_service" "order_api" {
   ]
 
   lifecycle {
-    # CI/CD pipeline updates the image on every commit.
-    # Terraform must not revert those changes.
+    # template[0].containers[0].image is intentionally NOT ignored:
+    # PATH A resolves the current running image into var.container_image
+    # before every terraform apply, so Terraform always deploys the correct image.
     ignore_changes = [
-      template[0].containers[0].image,
       template[0].revision,
       client,
       client_version,

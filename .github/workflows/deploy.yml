@@ -59,6 +59,30 @@ jobs:
           unzip -q /tmp/tf.zip -d /usr/local/bin/
           chmod +x /usr/local/bin/terraform
           terraform --version
+
+          # ── Resolve the current running image so Terraform doesn't use a stale digest ──
+          LATEST_REV=$(gcloud run services describe order-api \
+            --region asia-south1 \
+            --project ${{ secrets.GCP_PROJECT_ID }} \
+            --format "value(status.latestReadyRevisionName)")
+          echo "[INFO] Latest ready revision: $LATEST_REV"
+
+          CURRENT_IMAGE=$(gcloud run revisions describe "$LATEST_REV" \
+            --region asia-south1 \
+            --project ${{ secrets.GCP_PROJECT_ID }} \
+            --format "value(spec.containers[0].image)" 2>/dev/null || true)
+          echo "[INFO] Resolved image: $CURRENT_IMAGE"
+
+          # Fallback to enterprise-v2 if image is a stale digest or empty
+          if [[ -z "$CURRENT_IMAGE" ]] || [[ "$CURRENT_IMAGE" == mirror.gcr.io* ]] || [[ "$CURRENT_IMAGE" != *"/"* ]]; then
+            CURRENT_IMAGE="asia-south1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/infra-agent/order-api:enterprise-v2"
+            echo "[INFO] Using fallback image: $CURRENT_IMAGE"
+          fi
+
+          # Inject the resolved image into terraform.tfvars so Terraform uses it
+          sed -i "s|container_image = \".*\"|container_image = \"$CURRENT_IMAGE\"|" terraform/terraform.tfvars
+          echo "[INFO] terraform.tfvars updated with image: $CURRENT_IMAGE"
+
           cd terraform
           terraform init -input=false -reconfigure \
             -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
