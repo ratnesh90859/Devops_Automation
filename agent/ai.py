@@ -63,6 +63,25 @@ def _validate_diagnosis(d: dict, config: dict, logs: str = "", alert_body: dict 
     has_memory     = any(sig in logs_lower for sig in _memory_signals)
     has_regression = any(sig in logs_lower for sig in _regression_signals)
 
+    # ── Alert-source override: anomaly_detector alerts ───────────────────────
+    # anomaly_detector source signals a sudden statistical spike. Map to the
+    # correct issue type based on the metric that spiked.
+    _is_anomaly_alert = (alert_source == "anomaly_detector")
+    if _is_anomaly_alert:
+        _anomaly_metric = (alert_body or {}).get("anomaly_metric", "")
+        if _anomaly_metric == "latency_seconds":
+            issue = "timeout"
+            ftype = "infra"
+            has_regression = False
+        elif _anomaly_metric == "error_rate":
+            issue = "crash"
+            ftype = "code"
+            has_regression = False
+        elif _anomaly_metric == "request_rate":
+            issue = "high_cpu"
+            ftype = "infra"
+            has_regression = False
+
     # ── Alert-source override: threshold_monitor memory_high is ALWAYS oom ──
     # Regression detection must never fire when the trigger is a gradual memory
     # leak monitored by the threshold monitor — those commit SHAs in context
@@ -191,9 +210,41 @@ async def diagnose(logs: str, config: dict, alert_body: dict = None) -> dict:
             f"The issue started after a recent deployment — rollback is the correct fix.\n"
         )
 
+    # If alert explicitly came from anomaly_detector, inject specific hint
+    anomaly_hint = ""
+    if _alert_source_d == "anomaly_detector":
+        _anomaly_metric_d = (alert_body or {}).get("anomaly_metric", "")
+        _z_score          = (alert_body or {}).get("anomaly_z_score", "")
+        _ratio            = (alert_body or {}).get("anomaly_ratio", "")
+        anomaly_hint = (
+            f"\n\n🔴 ALERT SOURCE: anomaly_detector\n"
+            f"A SUDDEN STATISTICAL SPIKE was detected in metric '{_anomaly_metric_d}' "
+            f"(z={_z_score}σ, {_ratio}× above baseline). "
+            f"This is NOT a gradual threshold breach — it is a sharp, sudden change.\n"
+        )
+        if _anomaly_metric_d == "latency_seconds":
+            anomaly_hint += (
+                "Latency spiked suddenly. Most likely cause: CPU throttling, memory pressure, "
+                "or a slow external dependency. Suggest issue_type='timeout', fix_type='infra', "
+                "increase cloudrun_timeout or cpu.\n"
+            )
+        elif _anomaly_metric_d == "error_rate":
+            anomaly_hint += (
+                "Error rate spiked suddenly. Most likely cause: a bad deployment, "
+                "code exception, or dependency failure. Suggest issue_type='crash', fix_type='code'.\n"
+            )
+        elif _anomaly_metric_d == "request_rate":
+            anomaly_hint += (
+                "Request rate spiked suddenly (traffic spike). Most likely cause: viral traffic, "
+                "bot traffic, or upstream retry storm. Suggest issue_type='high_cpu', "
+                "fix_type='infra', increase cpu or max_instances.\n"
+            )
+        regression_hint = ""
+        if not detected_signals:
+            code_hint = ""
+            memory_hint = ""
+
     # If alert explicitly came from threshold_monitor memory_high, override hints
-    _alert_name_d   = (alert_body or {}).get("alertname", "")
-    _alert_source_d = (alert_body or {}).get("source", "")
     if _alert_source_d == "threshold_monitor" and _alert_name_d == "memory_high":
         regression_hint = ""  # never suggest regression for a threshold-fired memory alert
         if not detected_signals:
@@ -212,7 +263,7 @@ CURRENT SERVICE CONFIG:
 
 INCIDENT CONTEXT (alert payload, logs, metrics):
 {logs_trimmed}
-{code_hint}{memory_hint}{regression_hint}
+{code_hint}{memory_hint}{regression_hint}{anomaly_hint}
 
 TASK: Analyze the above and return a JSON diagnosis.
 

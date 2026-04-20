@@ -1,5 +1,5 @@
 from flask import Flask, jsonify, request, Response
-import os, time, psutil, logging, json as _json, threading, urllib.request as _urllib_req
+import os, time, psutil, logging, json as _json, threading, urllib.request as _urllib_req, math, collections
 from prometheus_client import (
     Counter, Histogram, Gauge,
     generate_latest, CONTENT_TYPE_LATEST
@@ -246,6 +246,169 @@ def _check_memory_threshold() -> None:
 
 app = Flask(__name__)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Anomaly Detector
+# ─────────────────────────────────────────────────────────────────────────────
+# Tracks a rolling baseline of 3 metrics sampled every second:
+#   • request_rate  — requests/sec in the last 1-second window
+#   • latency_p95   — 95th-percentile latency of the last 60 observations
+#   • error_rate    — fraction of requests returning 5xx in the last 60 obs
+#
+# A spike is flagged when the current value exceeds:
+#   baseline_mean + (Z_THRESHOLD × baseline_stddev)   AND
+#   baseline_mean × MIN_SPIKE_RATIO                   (must be a real spike, not just noise)
+#
+# The detector fires ONE alert per anomaly, with a cooldown between events.
+# -----------------------------------------------------------------------------
+
+_ANOMALY_WINDOW    = int(os.getenv("ANOMALY_WINDOW",    "60"))   # baseline samples
+_ANOMALY_Z         = float(os.getenv("ANOMALY_Z",       "3.0"))  # z-score threshold
+_ANOMALY_RATIO     = float(os.getenv("ANOMALY_RATIO",   "2.0"))  # must be ≥ 2× baseline mean
+_ANOMALY_COOLDOWN  = int(os.getenv("ANOMALY_COOLDOWN",  "120"))  # seconds between alerts
+_ANOMALY_MIN_OBS   = int(os.getenv("ANOMALY_MIN_OBS",   "30"))   # need this many observations before firing
+
+_anomaly_lock = threading.Lock()
+_anomaly_cooldown_until: float = 0.0
+_anomaly_last_fired: dict = {}   # metric → last fire time
+_anomaly_fired_flag: bool = False # single-fire per container lifecycle like memory alert
+
+# Per-metric sliding windows
+_anomaly_windows: dict = {
+    "latency_seconds":  collections.deque(maxlen=_ANOMALY_WINDOW),
+    "error_rate":       collections.deque(maxlen=_ANOMALY_WINDOW),
+    "request_rate":     collections.deque(maxlen=_ANOMALY_WINDOW),
+}
+
+# Request-rate bucket: count requests in the current second
+_rr_lock   = threading.Lock()
+_rr_bucket = {"ts": int(time.time()), "count": 0}
+
+
+def _record_request_for_anomaly(latency: float, is_error: bool) -> None:
+    """Called after each request to feed the anomaly detector windows."""
+    # Latency window
+    _anomaly_windows["latency_seconds"].append(latency)
+    # Error rate window (1 = error, 0 = ok)
+    _anomaly_windows["error_rate"].append(1.0 if is_error else 0.0)
+    # Request rate: count in current 1s bucket then push to window
+    now_bucket = int(time.time())
+    with _rr_lock:
+        if _rr_bucket["ts"] != now_bucket:
+            rate = _rr_bucket["count"]
+            _rr_bucket["ts"]   = now_bucket
+            _rr_bucket["count"] = 1
+            _anomaly_windows["request_rate"].append(float(rate))
+        else:
+            _rr_bucket["count"] += 1
+
+
+def _stats(window: collections.deque) -> tuple[float, float]:
+    """Return (mean, stddev) of a deque. Returns (0, 0) if < 2 items."""
+    data = list(window)
+    n = len(data)
+    if n < 2:
+        return 0.0, 0.0
+    mean = sum(data) / n
+    variance = sum((x - mean) ** 2 for x in data) / n
+    return mean, math.sqrt(variance)
+
+
+def _check_anomaly(metric: str, current: float) -> None:
+    """
+    Compare current value against rolling baseline.
+    If it's a statistical spike, fire an alert to the agent.
+    """
+    global _anomaly_cooldown_until
+    window = _anomaly_windows[metric]
+    if len(window) < _ANOMALY_MIN_OBS:
+        return  # not enough baseline data yet
+
+    mean, stddev = _stats(window)
+    if mean <= 0:
+        return
+
+    # Z-score
+    z = (current - mean) / stddev if stddev > 0 else 0.0
+    # Spike ratio
+    ratio = current / mean if mean > 0 else 0.0
+
+    if z < _ANOMALY_Z or ratio < _ANOMALY_RATIO:
+        return  # not a real spike
+
+    now = time.time()
+    with _anomaly_lock:
+        last = _anomaly_last_fired.get(metric, 0.0)
+        if now - last < _ANOMALY_COOLDOWN:
+            return  # still in per-metric cooldown
+        _anomaly_last_fired[metric] = now
+
+    # Build human-readable description of the anomaly
+    labels = {
+        "latency_seconds": ("p95 latency",     "s",  "high_latency"),
+        "error_rate":      ("5xx error rate",   "%",  "error_spike"),
+        "request_rate":    ("request rate",     "rps","traffic_spike"),
+    }
+    label, unit, atype = labels[metric]
+    display_current = round(current * 100, 1) if metric == "error_rate" else round(current, 3)
+    display_mean    = round(mean    * 100, 1) if metric == "error_rate" else round(mean,    3)
+    unit_str        = "%" if metric == "error_rate" else unit
+
+    mem_mb  = round(psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024, 1)
+    uptime  = round(time.time() - _app_start_time, 0)
+
+    log_infra("anomaly_detected",
+              metric=metric,
+              current=display_current,
+              baseline_mean=display_mean,
+              z_score=round(z, 2),
+              spike_ratio=round(ratio, 2))
+
+    payload = {
+        "source":       "anomaly_detector",
+        "alertname":    f"anomaly_{atype}",
+        "severity":     "high",
+        "service":      "order-api",
+        "metric":       metric,
+        "value":        str(display_current),
+        "threshold":    str(display_mean),
+        "summary":      (
+            f"Anomaly detected: {label} spiked to {display_current}{unit_str} "
+            f"(baseline {display_mean}{unit_str}, z={round(z,2):.1f}σ, {round(ratio,1)}× normal)"
+        ),
+        "description":  (
+            f"Statistical anomaly: {label} is {round(ratio,1)}× above baseline "
+            f"and {round(z,2):.1f} standard deviations from normal. "
+            f"Baseline (last {_ANOMALY_WINDOW}s) mean={display_mean}{unit_str}, stddev={round(stddev*(100 if metric=='error_rate' else 1),3)}. "
+            f"This may indicate a sudden traffic spike, deployment issue, or infrastructure problem."
+        ),
+        "infra_logs":   (
+            f"[INFRA] anomaly_metric={metric} current={display_current}{unit_str} "
+            f"baseline={display_mean}{unit_str} z_score={round(z,2)} "
+            f"spike_ratio={round(ratio,2)} memory_mb={mem_mb} uptime_secs={uptime}"
+        ),
+        "app_logs":     (
+            f"[APP] anomaly_type={atype} "
+            f"total_requests={_THRESHOLDS['total_requests']['count']} "
+            f"total_errors={_THRESHOLDS['total_errors']['count']} "
+            f"error_rate_pct={round(_THRESHOLDS['total_errors']['count'] / max(_THRESHOLDS['total_requests']['count'],1)*100,1)}"
+        ),
+        "business_logs": (
+            f"[BIZ] spike_detected=true metric={metric} "
+            f"deviation={round(z,1)}sigma ratio={round(ratio,1)}x "
+            f"service_impact=possible_degradation"
+        ),
+        "anomaly_metric":  metric,
+        "anomaly_z_score": round(z, 2),
+        "anomaly_ratio":   round(ratio, 2),
+        "baseline_mean":   display_mean,
+        "baseline_stddev": round(stddev * (100 if metric == "error_rate" else 1), 3),
+        "memory_mb":       mem_mb,
+        "total_requests":  _THRESHOLDS["total_requests"]["count"],
+        "total_errors":    _THRESHOLDS["total_errors"]["count"],
+    }
+    _post_alert_background(payload)
+
+
 REQUEST_COUNT = Counter(
     "http_requests_total",
     "Total HTTP requests",
@@ -279,13 +442,14 @@ def start_timer():
 def record_metrics(response):
     latency = time.time() - getattr(request, '_start', time.time())
     ep = request.path
+    is_error = response.status_code >= 500
     REQUEST_COUNT.labels(
         method=request.method,
         endpoint=ep,
         http_status=response.status_code
     ).inc()
     REQUEST_LATENCY.labels(endpoint=ep).observe(latency)
-    if response.status_code >= 500:
+    if is_error:
         ERROR_TOTAL.labels(endpoint=ep).inc()
         log_app("http_error", endpoint=ep, status=response.status_code,
                 latency_s=round(latency, 3))
@@ -295,6 +459,21 @@ def record_metrics(response):
     # Count every request (skip internal /metrics and /health probes)
     if ep not in ("/metrics", "/health"):
         _increment_threshold("total_requests")
+        # Feed anomaly detector
+        _record_request_for_anomaly(latency, is_error)
+        # Check anomaly on latency and error_rate
+        _check_anomaly("latency_seconds", latency)
+        err_win = _anomaly_windows["error_rate"]
+        if len(err_win) >= _ANOMALY_MIN_OBS:
+            recent_err_rate = sum(list(err_win)[-10:]) / 10  # last 10 requests
+            _check_anomaly("error_rate", recent_err_rate)
+        # Check request rate spike (evaluated every 5 requests to reduce noise)
+        if _THRESHOLDS["total_requests"]["count"] % 5 == 0:
+            rr_win = _anomaly_windows["request_rate"]
+            if len(rr_win) >= _ANOMALY_MIN_OBS:
+                with _rr_lock:
+                    current_rate = float(_rr_bucket["count"])
+                _check_anomaly("request_rate", current_rate)
     # Check memory on every request — fires when RSS > 80% of container limit
     _check_memory_threshold()
     return response
@@ -461,6 +640,7 @@ def reset():
     Call this before retesting any scenario.
     """
     global _leak_store, _heavy_enabled, _COOLDOWN_UNTIL, _MEMORY_ALERT_FIRED
+    global _anomaly_cooldown_until, _anomaly_last_fired
     cleared_items = len(_leak_store)
     _leak_store = []
     _heavy_enabled = True
@@ -474,10 +654,32 @@ def reset():
     _MEMORY_ALERT_FIRED = False
     log_infra("thresholds_reset_via_reset_endpoint")
 
+    # Reset anomaly detector windows and cooldowns
+    with _anomaly_lock:
+        for w in _anomaly_windows.values():
+            w.clear()
+        _anomaly_cooldown_until = 0.0
+        _anomaly_last_fired.clear()
+    log_infra("anomaly_detector_reset_via_reset_endpoint")
+
     import gc
     gc.collect()
 
     mem_after = psutil.Process(os.getpid()).memory_info().rss // (1024 * 1024)
+
+    # Also clear the agent's dedup lock so fresh alerts can be processed
+    agent_cleared = False
+    try:
+        import urllib.request, urllib.error
+        req = urllib.request.Request(
+            f"{_AGENT_WEBHOOK.rstrip('/webhook')}/clear",
+            method="POST",
+            headers={"X-Token": _WEBHOOK_SECRET, "Content-Length": "0"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            agent_cleared = (resp.status == 200)
+    except Exception as _e:
+        print(f"[WARN] /reset: could not clear agent dedup lock: {_e}")
 
     return jsonify({
         "reset": True,
@@ -485,13 +687,74 @@ def reset():
         "heavy_enabled": True,
         "memory_after_mb": mem_after,
         "thresholds_reset": True,
-        "message": "All simulated issues cleared and threshold counters reset. Ready to retest.",
+        "anomaly_detector_reset": True,
+        "agent_dedup_cleared": agent_cleared,
+        "message": "All simulated issues cleared, threshold counters and anomaly detector reset. Ready to retest.",
+    })
+
+
+@app.route("/spike")
+def spike():
+    """
+    Simulate a sudden latency spike for anomaly detection testing.
+    Adds artificial delay to create a statistical anomaly in the latency window.
+    Query params:
+      - latency=N   (seconds, default 5) — how long to sleep
+      - errors=N    (default 0) — inject N synthetic error records into the window
+    """
+    spike_latency = float(request.args.get("latency", "5"))
+    inject_errors = int(request.args.get("errors", "0"))
+
+    log_app("spike_endpoint_called", latency_s=spike_latency, inject_errors=inject_errors)
+
+    # Inject synthetic error observations directly into the window to force
+    # an error-rate anomaly without needing real 500 responses
+    if inject_errors > 0:
+        for _ in range(inject_errors):
+            _anomaly_windows["error_rate"].append(1.0)
+        log_infra("anomaly_test_errors_injected", count=inject_errors)
+
+    time.sleep(spike_latency)
+    return jsonify({
+        "spike": True,
+        "latency_s": spike_latency,
+        "errors_injected": inject_errors,
+        "message": f"Slept {spike_latency}s — anomaly detector should fire if baseline exists",
+    })
+
+
+@app.route("/anomaly/status")
+def anomaly_status():
+    """Show current anomaly detector state — windows, baselines, last fire times."""
+    result = {}
+    for metric, window in _anomaly_windows.items():
+        data = list(window)
+        mean, stddev = _stats(window) if len(data) >= 2 else (0.0, 0.0)
+        multiplier = 100 if metric == "error_rate" else 1
+        last_fire = _anomaly_last_fired.get(metric, 0.0)
+        result[metric] = {
+            "observations":    len(data),
+            "required":        _ANOMALY_MIN_OBS,
+            "ready":           len(data) >= _ANOMALY_MIN_OBS,
+            "baseline_mean":   round(mean * multiplier, 3),
+            "baseline_stddev": round(stddev * multiplier, 3),
+            "last_fired_secs_ago": round(time.time() - last_fire, 0) if last_fire else None,
+            "cooldown_remaining":  max(0, round(last_fire + _ANOMALY_COOLDOWN - time.time(), 0)) if last_fire else 0,
+        }
+    return jsonify({
+        "anomaly_detector": result,
+        "z_threshold":   _ANOMALY_Z,
+        "ratio_threshold": _ANOMALY_RATIO,
+        "window_size":   _ANOMALY_WINDOW,
+        "min_observations": _ANOMALY_MIN_OBS,
     })
 
 
 @app.route("/metrics")
 def metrics():
     return Response(generate_latest(), mimetype=CONTENT_TYPE_LATEST)
+
+
 
 
 # ── Threshold admin endpoints ──────────────────────────────────────────────────
