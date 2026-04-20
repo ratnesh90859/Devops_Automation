@@ -262,10 +262,10 @@ app = Flask(__name__)
 # -----------------------------------------------------------------------------
 
 _ANOMALY_WINDOW    = int(os.getenv("ANOMALY_WINDOW",    "60"))   # baseline samples
-_ANOMALY_Z         = float(os.getenv("ANOMALY_Z",       "3.0"))  # z-score threshold
-_ANOMALY_RATIO     = float(os.getenv("ANOMALY_RATIO",   "2.0"))  # must be ≥ 2× baseline mean
+_ANOMALY_Z         = float(os.getenv("ANOMALY_Z",       "2.5"))  # z-score threshold (lowered for sub-ms baselines)
+_ANOMALY_RATIO     = float(os.getenv("ANOMALY_RATIO",   "3.0"))  # must be ≥ 3× baseline mean
 _ANOMALY_COOLDOWN  = int(os.getenv("ANOMALY_COOLDOWN",  "120"))  # seconds between alerts
-_ANOMALY_MIN_OBS   = int(os.getenv("ANOMALY_MIN_OBS",   "30"))   # need this many observations before firing
+_ANOMALY_MIN_OBS   = int(os.getenv("ANOMALY_MIN_OBS",   "20"))   # need this many observations before firing
 
 _anomaly_lock = threading.Lock()
 _anomaly_cooldown_until: float = 0.0
@@ -274,32 +274,68 @@ _anomaly_fired_flag: bool = False # single-fire per container lifecycle like mem
 
 # Per-metric sliding windows
 _anomaly_windows: dict = {
-    "latency_seconds":  collections.deque(maxlen=_ANOMALY_WINDOW),
-    "error_rate":       collections.deque(maxlen=_ANOMALY_WINDOW),
-    "request_rate":     collections.deque(maxlen=_ANOMALY_WINDOW),
+    "latency_p95":   collections.deque(maxlen=_ANOMALY_WINDOW),  # 5-sec interval p95 latency
+    "error_rate":    collections.deque(maxlen=_ANOMALY_WINDOW),  # 5-sec interval error fraction
+    "request_rate":  collections.deque(maxlen=_ANOMALY_WINDOW),  # 5-sec interval req/s
 }
 
-# Request-rate bucket: count requests in the current second
-_rr_lock   = threading.Lock()
-_rr_bucket = {"ts": int(time.time()), "count": 0}
+# Per-5s bucket accumulators (filled by after_request, drained by background sampler)
+_bucket_lock   = threading.Lock()
+_bucket: dict  = {"latencies": [], "errors": 0, "requests": 0, "ts": time.time()}
 
 
 def _record_request_for_anomaly(latency: float, is_error: bool) -> None:
-    """Called after each request to feed the anomaly detector windows."""
-    # Latency window
-    _anomaly_windows["latency_seconds"].append(latency)
-    # Error rate window (1 = error, 0 = ok)
-    _anomaly_windows["error_rate"].append(1.0 if is_error else 0.0)
-    # Request rate: count in current 1s bucket then push to window
-    now_bucket = int(time.time())
-    with _rr_lock:
-        if _rr_bucket["ts"] != now_bucket:
-            rate = _rr_bucket["count"]
-            _rr_bucket["ts"]   = now_bucket
-            _rr_bucket["count"] = 1
-            _anomaly_windows["request_rate"].append(float(rate))
-        else:
-            _rr_bucket["count"] += 1
+    """Called after each request to accumulate into the current 5s bucket."""
+    with _bucket_lock:
+        _bucket["latencies"].append(latency)
+        _bucket["requests"]  += 1
+        if is_error:
+            _bucket["errors"] += 1
+
+
+def _anomaly_sampler_loop() -> None:
+    """
+    Background thread — wakes every 5 seconds, drains the bucket into sliding
+    windows, then checks each metric for statistical anomalies.
+    Runs for the lifetime of the process.
+    """
+    while True:
+        time.sleep(5)
+        try:
+            with _bucket_lock:
+                latencies  = list(_bucket["latencies"])
+                errors     = _bucket["errors"]
+                requests   = _bucket["requests"]
+                _bucket["latencies"] = []
+                _bucket["errors"]    = 0
+                _bucket["requests"]  = 0
+                _bucket["ts"]        = time.time()
+
+            if requests == 0:
+                continue  # no traffic in this window, skip
+
+            # Compute 5s-window metrics
+            p95_latency  = sorted(latencies)[int(len(latencies) * 0.95)] if latencies else 0.0
+            err_rate     = errors / requests
+            req_per_sec  = requests / 5.0
+
+            # Push into sliding windows
+            _anomaly_windows["latency_p95"].append(p95_latency)
+            _anomaly_windows["error_rate"].append(err_rate)
+            _anomaly_windows["request_rate"].append(req_per_sec)
+
+            # Check each metric for anomaly
+            _check_anomaly("latency_p95",   p95_latency)
+            _check_anomaly("error_rate",    err_rate)
+            _check_anomaly("request_rate",  req_per_sec)
+
+        except Exception as exc:
+            log_infra("anomaly_sampler_error", error=str(exc))
+
+
+# Start the background sampler as a daemon thread
+_sampler_thread = threading.Thread(target=_anomaly_sampler_loop, daemon=True, name="anomaly-sampler")
+_sampler_thread.start()
 
 
 def _stats(window: collections.deque) -> tuple[float, float]:
@@ -344,11 +380,11 @@ def _check_anomaly(metric: str, current: float) -> None:
 
     # Build human-readable description of the anomaly
     labels = {
-        "latency_seconds": ("p95 latency",     "s",  "high_latency"),
-        "error_rate":      ("5xx error rate",   "%",  "error_spike"),
-        "request_rate":    ("request rate",     "rps","traffic_spike"),
+        "latency_p95":   ("p95 latency",   "s",   "high_latency"),
+        "error_rate":    ("5xx error rate", "%",   "error_spike"),
+        "request_rate":  ("request rate",  "rps", "traffic_spike"),
     }
-    label, unit, atype = labels[metric]
+    label, unit, atype = labels.get(metric, (metric, "", "anomaly"))
     display_current = round(current * 100, 1) if metric == "error_rate" else round(current, 3)
     display_mean    = round(mean    * 100, 1) if metric == "error_rate" else round(mean,    3)
     unit_str        = "%" if metric == "error_rate" else unit
@@ -459,21 +495,8 @@ def record_metrics(response):
     # Count every request (skip internal /metrics and /health probes)
     if ep not in ("/metrics", "/health"):
         _increment_threshold("total_requests")
-        # Feed anomaly detector
+        # Feed anomaly bucket — sampler thread aggregates every 5s and checks
         _record_request_for_anomaly(latency, is_error)
-        # Check anomaly on latency and error_rate
-        _check_anomaly("latency_seconds", latency)
-        err_win = _anomaly_windows["error_rate"]
-        if len(err_win) >= _ANOMALY_MIN_OBS:
-            recent_err_rate = sum(list(err_win)[-10:]) / 10  # last 10 requests
-            _check_anomaly("error_rate", recent_err_rate)
-        # Check request rate spike (evaluated every 5 requests to reduce noise)
-        if _THRESHOLDS["total_requests"]["count"] % 5 == 0:
-            rr_win = _anomaly_windows["request_rate"]
-            if len(rr_win) >= _ANOMALY_MIN_OBS:
-                with _rr_lock:
-                    current_rate = float(_rr_bucket["count"])
-                _check_anomaly("request_rate", current_rate)
     # Check memory on every request — fires when RSS > 80% of container limit
     _check_memory_threshold()
     return response
@@ -654,12 +677,16 @@ def reset():
     _MEMORY_ALERT_FIRED = False
     log_infra("thresholds_reset_via_reset_endpoint")
 
-    # Reset anomaly detector windows and cooldowns
+    # Reset anomaly detector windows, bucket, and cooldowns
     with _anomaly_lock:
         for w in _anomaly_windows.values():
             w.clear()
         _anomaly_cooldown_until = 0.0
         _anomaly_last_fired.clear()
+    with _bucket_lock:
+        _bucket["latencies"] = []
+        _bucket["errors"]    = 0
+        _bucket["requests"]  = 0
     log_infra("anomaly_detector_reset_via_reset_endpoint")
 
     import gc
@@ -707,14 +734,22 @@ def spike():
 
     log_app("spike_endpoint_called", latency_s=spike_latency, inject_errors=inject_errors)
 
-    # Inject synthetic error observations directly into the window to force
-    # an error-rate anomaly without needing real 500 responses
+    # Inject synthetic error observations into the bucket to force error-rate anomaly
     if inject_errors > 0:
-        for _ in range(inject_errors):
-            _anomaly_windows["error_rate"].append(1.0)
+        with _bucket_lock:
+            for _ in range(inject_errors):
+                _bucket["latencies"].append(0.001)
+                _bucket["requests"] += 1
+                _bucket["errors"]   += 1
         log_infra("anomaly_test_errors_injected", count=inject_errors)
 
     time.sleep(spike_latency)
+    # Also inject the spike latency directly into bucket so sampler picks it up
+    with _bucket_lock:
+        for _ in range(5):   # inject 5 samples at spike latency for clear signal
+            _bucket["latencies"].append(spike_latency)
+            _bucket["requests"] += 1
+    log_infra("anomaly_test_spike_injected", latency_s=spike_latency, samples=5)
     return jsonify({
         "spike": True,
         "latency_s": spike_latency,
@@ -741,12 +776,20 @@ def anomaly_status():
             "last_fired_secs_ago": round(time.time() - last_fire, 0) if last_fire else None,
             "cooldown_remaining":  max(0, round(last_fire + _ANOMALY_COOLDOWN - time.time(), 0)) if last_fire else 0,
         }
+    with _bucket_lock:
+        pending = {
+            "latencies_count": len(_bucket["latencies"]),
+            "requests": _bucket["requests"],
+            "errors":   _bucket["errors"],
+        }
     return jsonify({
-        "anomaly_detector": result,
-        "z_threshold":   _ANOMALY_Z,
-        "ratio_threshold": _ANOMALY_RATIO,
-        "window_size":   _ANOMALY_WINDOW,
-        "min_observations": _ANOMALY_MIN_OBS,
+        "anomaly_detector":  result,
+        "current_bucket":    pending,
+        "z_threshold":       _ANOMALY_Z,
+        "ratio_threshold":   _ANOMALY_RATIO,
+        "window_size":       _ANOMALY_WINDOW,
+        "min_observations":  _ANOMALY_MIN_OBS,
+        "sample_interval_s": 5,
     })
 
 

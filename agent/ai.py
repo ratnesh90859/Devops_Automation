@@ -69,7 +69,7 @@ def _validate_diagnosis(d: dict, config: dict, logs: str = "", alert_body: dict 
     _is_anomaly_alert = (alert_source == "anomaly_detector")
     if _is_anomaly_alert:
         _anomaly_metric = (alert_body or {}).get("anomaly_metric", "")
-        if _anomaly_metric == "latency_seconds":
+        if _anomaly_metric in ("latency_seconds", "latency_p95"):
             issue = "timeout"
             ftype = "infra"
             has_regression = False
