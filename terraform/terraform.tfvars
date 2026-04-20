@@ -3,7 +3,7 @@ region       = "asia-south1"
 service_name = "order-api"
 
 # ── Cloud Run live values — agent patches these via terraform apply ──
-cloudrun_memory = "512Mi"
+cloudrun_memory = "256Mi"
 container_image = "asia-south1-docker.pkg.dev/testing-ratnesh/infra-agent/order-api:enterprise-v2"
 cloudrun_cpu           = "1"
 cloudrun_timeout       = 30
